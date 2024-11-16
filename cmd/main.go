@@ -17,7 +17,7 @@ import (
 	"os"
 
 	//FIXME Local tweaked copy for now. Need to break this out on its own.
-	"github.com/spiffe/spire-ha-agent/peertracker"
+	"github.com/spiffe/spire-ha-agent/pkg/peertracker"
         jose "github.com/go-jose/go-jose/v4"
 
 	"google.golang.org/grpc"
