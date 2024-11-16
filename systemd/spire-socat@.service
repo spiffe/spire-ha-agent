@@ -1,0 +1,43 @@
+
+[Unit]
+Description=SPIRE socat %i
+PartOf=spire-agent.target
+After=network-online.target local-fs.target time-sync.target
+Wants=network-online.target local-fs.target time-sync.target remote-fs-pre.target spire-agent.target
+StartLimitIntervalSec=0
+
+[Service]
+WorkingDirectory=/tmp
+StateDirectory=spire/agent/%i
+RuntimeDirectory=spire/agent/sockets/%i
+RuntimeDirectoryPreserve=true
+ConfigurationDirectory=spire/socat
+EnvironmentFile=-/etc/spire/socat/%i.conf
+ExecStart=socat UNIX-LISTEN:/var/run/spire/agent/sockets/%i/public/api.sock,fork VSOCK-CONNECT:2:${SPIRE_SOCAT_PORT}
+ExecStartPre=mkdir -p /var/run/spire/agent/sockets/%i/public
+# https://gist.github.com/ageis/f5595e59b1cddb1513d1b425a323db04
+LockPersonality=true
+MemoryDenyWriteExecute=true
+NoNewPrivileges=true
+PrivateDevices=false
+# Needed by plugins
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadOnlyPaths=/
+ReadWritePaths=/var/lib/spire/agent /var/run/spire/agent
+Restart=always
+RestartSec=5s
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_VSOCK
+RestrictNamespaces=true
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+TasksMax=infinity
+
+[Install]
+WantedBy=spire-agent.target
