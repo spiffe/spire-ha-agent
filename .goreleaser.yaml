@@ -30,6 +30,8 @@ archives:
       {{- if .Arm }}v{{ .Arm }}{{ end }}
     files:
       - systemd/*
+      - README.md
+      - LICENSE
     # use zip for windows archives
     format_overrides:
       - goos: windows
