@@ -1,9 +1,14 @@
 package peertracker
 
-import "os/exec"
-import "fmt"
-import "bytes"
-import "gopkg.in/yaml.v3"
+import (
+	"bytes"
+	"fmt"
+	"net"
+	"os/exec"
+
+	"github.com/mdlayher/vsock"
+	"gopkg.in/yaml.v3"
+)
 
 // #include <tracefs.h>
 //import "C"
@@ -40,4 +45,20 @@ func CID2PID(cid int) int {
 		return -5
 	}
 	return c2p.Pid
+}
+
+func CallerFromVSockConn(conn net.Conn) (CallerInfo, error) {
+	var info CallerInfo
+	cid := int(conn.RemoteAddr().(*vsock.Addr).ContextID)
+	pid := CID2PID(cid)
+	fmt.Printf("Got PID %d for CID %d\n", pid, cid)
+	if pid < 0 {
+		return info, fmt.Errorf("Could not fetch PID from CID")
+	}
+	info = CallerInfo{
+		PID: int32(pid),
+	}
+
+	info.Addr = conn.RemoteAddr()
+	return info, nil
 }
