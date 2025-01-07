@@ -1,6 +1,8 @@
 package peertracker
 
 import (
+	"os"
+
 	"github.com/mdlayher/vsock"
 )
 
