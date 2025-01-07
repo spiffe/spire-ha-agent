@@ -5,7 +5,10 @@ import (
 )
 
 func (lf *ListenerFactory) ListenVSock(port uint32) (*Listener, error) {
-	if lf.NewUnixListener == nil {
+	if _, err := os.Stat("/dev/vsock"); err != nil {
+		return nil, err
+	}
+	if lf.NewVSockListener == nil {
 		lf.NewVSockListener = vsock.Listen
 	}
 	if lf.NewTracker == nil {
