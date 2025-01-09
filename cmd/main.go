@@ -610,8 +610,22 @@ func main() {
 		grpc.StreamInterceptor(streamInterceptor),
 	)
 
-	setupClient(ls, "clientA", 0, "unix:///var/run/spire/agent/sockets/a/private/admin.sock", &ls.clients[0])
-	setupClient(ls, "clientB", 1, "unix:///var/run/spire/agent/sockets/b/private/admin.sock", &ls.clients[1])
+	apath := "unix:///var/run/spire/agent/sockets/a/private/admin.sock"
+	bpath := "unix:///var/run/spire/agent/sockets/a/private/admin.sock"
+	aname := "SPIRE_HA_AGENT_SOCKET"
+	if ls.multi {
+		aname = "SPIRE_HA_AGENT_SOCKET_A"
+	}
+	if os.Getenv(aname) != "" {
+		apath = os.Getenv(aname)
+	}
+	setupClient(ls, "clientA", 0, apath, &ls.clients[0])
+	if !ls.multi {
+		if os.Getenv("SPIRE_HA_AGENT_SOCKET_B") != "" {
+			bpath = os.Getenv("SPIRE_HA_AGENT_SOCKET_B")
+		}
+		setupClient(ls, "clientB", 1, bpath, &ls.clients[1])
+	}
 
 	go func() {
 		for {
@@ -665,6 +679,9 @@ func main() {
 		for u := range ls.jwtBundleUpdate {
 			log.Printf("Got update for %d\n", u.id)
 			ls.clients[u.id].jwtBundles = u.bundle
+			if !ls.multi {
+				ls.clients[1].jwtBundles = u.bundle
+			}
 			if ls.clients[0].jwtBundles != nil && ls.clients[1].jwtBundles != nil {
 				log.Printf("We got two jwt bundles\n")
 				tmpBundles := make(map[string]jose.JSONWebKeySet)
