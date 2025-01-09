@@ -460,7 +460,7 @@ func parseX509Bundles(bun map[string][]byte) (*x509bundle.Set, error) {
 	return x509bundle.NewSet(bundles...), nil
 }
 
-func setupClient(ls *server, clientName string, id int, mainSockName string, adminSocketName string, cs *clientSet) {
+func setupClient(ls *server, clientName string, id int, adminSocketName string, cs *clientSet) {
 	//Raw client code: https://github.com/spiffe/go-spiffe/blob/main/v2/workloadapi/client.go#L255
 	var dialOptions []grpc.DialOption
 //	var conn *grpc.ClientConn
@@ -610,8 +610,8 @@ func main() {
 		grpc.StreamInterceptor(streamInterceptor),
 	)
 
-	setupClient(ls, "clientA", 0, "unix:///var/run/spire/agent/sockets/a/public/api.sock", "unix:///var/run/spire/agent/sockets/a/private/admin.sock", &ls.clients[0])
-	setupClient(ls, "clientB", 1, "unix:///var/run/spire/agent/sockets/b/public/api.sock", "unix:///var/run/spire/agent/sockets/b/private/admin.sock", &ls.clients[1])
+	setupClient(ls, "clientA", 0, "unix:///var/run/spire/agent/sockets/a/private/admin.sock", &ls.clients[0])
+	setupClient(ls, "clientB", 1, "unix:///var/run/spire/agent/sockets/b/private/admin.sock", &ls.clients[1])
 
 	go func() {
 		for {
