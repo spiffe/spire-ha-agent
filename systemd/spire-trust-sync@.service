@@ -1,0 +1,47 @@
+[Unit]
+Description=SPIRE Trust Bundle Sync %i
+PartOf=spire.target
+After=network-online.target local-fs.target time-sync.target
+Before=remote-fs-pre.target
+Wants=network-online.target local-fs.target time-sync.target remote-fs-pre.target spire-agent.target
+StartLimitIntervalSec=0
+
+[Service]
+WorkingDirectory=/var/run
+StateDirectory=spire/trust-sync/%i
+RuntimeDirectory=spire/trust-sync/%i
+RuntimeDirectoryPreserve=true
+ConfigurationDirectory=spire/trust-sync
+Environment="SPIRE_AGENT_ADDRESS=/var/run/spire/agent/sockets/%i/public/api.sock"
+Environment="SPIRE_TRUST_SYNC_BUNDLE=/var/run/spire/trust-sync/%i/ca.crt"
+EnvironmentFile=-/etc/spire/trust-sync/default.conf
+EnvironmentFile=-/etc/spire/trust-sync/%i.conf
+ExecStart=/bin/spiffe-helper -config /var/run/spire/trust-sync/%i/helper.conf
+ExecStartPre=mkdir -p /run/spire/trust-sync/%i/
+ExecStartPre=/bin/bash -c "echo Y2VydF9kaXIgPSAiQENEQCIKc3ZpZF9maWxlX25hbWUgPSAidGxzLmNydCIKc3ZpZF9rZXlfZmlsZV9uYW1lID0gInRscy5rZXkiCnN2aWRfYnVuZGxlX2ZpbGVfbmFtZSA9ICJjYS5jcnQiCmNtZCA9ICJiYXNoIgpjbWRfYXJncyA9ICItYyBcInNwaXJlLXNlcnZlciBidW5kbGUgc2V0IC1pZCBzcGlmZmU6Ly8ke1NQSVJFX1RSVVNUX1NZTkNfVFJVU1RET01BSU59IC1zb2NrZXRQYXRoICR7U1BJUkVfU0VSVkVSX1NPQ0tFVH0gPCAke1NQSVJFX1RSVVNUX1NZTkNfQlVORExFfVwiIgo= | base64 -d > /var/run/spire/trust-sync/%i/helper.conf"
+ExecStartPre=/bin/sed -i "s^@CD@^/var/run/spire/trust-sync/%i^" /var/run/spire/trust-sync/%i/helper.conf
+# https://gist.github.com/ageis/f5595e59b1cddb1513d1b425a323db04
+LockPersonality=true
+MemoryDenyWriteExecute=true
+NoNewPrivileges=true
+PrivateDevices=false
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadOnlyPaths=/
+ReadWritePaths=/run/spire/agent
+Restart=always
+RestartSec=5s
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+TasksMax=infinity
+
+[Install]
+WantedBy=spire.target
