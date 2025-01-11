@@ -10,9 +10,13 @@ An agent to setup a SPIRE HA TrustDomain using two independent SPIRE Servers
 This code is very early in development and is very experimental. Please do not use it in production yet. Please do consider testing it out, provide feedback,
 and maybe provide fixes.
 
-## Diagram
+## Simple Diagram
 
 ![diagram](diagram.png)
+
+## Cross Linked Trust Diagram
+
+![diagram](diagram2.png)
 
 ## How it Works
 

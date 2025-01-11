@@ -1,0 +1,108 @@
+digraph G {
+  subgraph cluster_server2 {
+
+      label = "node name: n2"
+      #style = dashed
+        style="filled,solid,bold";
+        color="#b3b3b3";
+        fillcolor="#f5f5f5";
+        labeljust="l"; 
+      subgraph cluster_node2_systemd {
+          #label = "Systemd"
+          label = "systemd managed"
+          style = "dashed,filled"
+          color="#939393";
+          fillcolor="#d5d5d5";
+    spire_server_2[label=<<table border="0"><tr><td><b>SPIRE Server B</b></td></tr><tr><td align="left"><font point-size="9">NodeAttestors: tpm</font></td></tr></table>>,shape="record",style="rounded,solid,filled,bold",color="#6c8ebf",fillcolor="#dae8fc"]
+          spire_agent_a[label=<<table border="0"><tr><td><b>SPIRE Agent A</b></td></tr><tr><td align="left"><font point-size="9">NodeAttestor: tpm</font></td></tr><tr><td align="left"><font point-size="9">WorkloadAttestor: systemd</font></td></tr><tr><td align="left"><font point-size="9">systemd: spire-agent@.service</font></td></tr></table>>,shape="record",style="rounded,solid,filled,bold",color="#82b366",fillcolor="#d5e8d4"]
+          spire_trust_sync_a[label=<<table border="0"><tr><td><b>SPIRE Trust Sync A</b></td></tr><tr><td align="left"><font point-size="9">NodeAttestor: tpm</font></td></tr><tr><td align="left"><font point-size="9">WorkloadAttestor: systemd</font></td></tr><tr><td align="left"><font point-size="9">systemd: spire-trust-sync@.service</font></td></tr></table>>,shape="record",style="rounded,solid,filled,bold",color="#82b366",fillcolor="#d5e8d4"]
+          spire_server_tb_a[label="Trust Bundle A", shape=note,style="rounded,dashed,filled,bold",fillcolor="#ffffff"]
+      }
+  }
+
+  subgraph cluster_server1 {
+      label = "node name: n1"
+      #style = dashed
+        style="filled,solid,bold";
+        color="#b3b3b3";
+        fillcolor="#f5f5f5";
+        labeljust="l"; 
+      subgraph cluster_node1_systemd {
+          #label = "Systemd"
+          label = "systemd managed"
+          style = "dashed,filled"
+          color="#939393";
+          fillcolor="#d5d5d5";
+
+    spire_server_1[label=<<table border="0"><tr><td><b>SPIRE Server A</b></td></tr><tr><td align="left"><font point-size="9">NodeAttestors: tpm</font></td></tr></table>>,shape="record",style="rounded,solid,filled,bold",color="#6c8ebf",fillcolor="#dae8fc"]
+          spire_agent_b[label=<<table border="0"><tr><td><b>SPIRE Agent B</b></td></tr><tr><td align="left"><font point-size="9">NodeAttestor: tpm</font></td></tr><tr><td align="left"><font point-size="9">WorkloadAttestor: systemd</font></td></tr><tr><td align="left"><font point-size="9">systemd: spire-agent@.service</font></td></tr></table>>,shape="record",style="rounded,solid,filled,bold",color="#82b366",fillcolor="#d5e8d4"]
+          spire_trust_sync_b[label=<<table border="0"><tr><td><b>SPIRE Trust Sync B</b></td></tr><tr><td align="left"><font point-size="9">NodeAttestor: tpm</font></td></tr><tr><td align="left"><font point-size="9">WorkloadAttestor: systemd</font></td></tr><tr><td align="left"><font point-size="9">systemd: spire-trust-sync@.service</font></td></tr></table>>,shape="record",style="rounded,solid,filled,bold",color="#82b366",fillcolor="#d5e8d4"]
+          spire_server_tb_b[label="Trust Bundle B", shape=note,style="rounded,dashed,filled,bold",fillcolor="#ffffff"]
+      }
+  }
+
+  
+  subgraph cluster_node3 {
+      label = "node name: n3"
+      #style = dashed
+        style="filled,solid,bold";
+        color="#b3b3b3";
+        fillcolor="#f5f5f5";
+        labeljust="l"; 
+
+      subgraph cluster_node3_systemd {
+          #label = "Systemd"
+          label = "systemd managed"
+          style = "dashed,filled"
+          color="#939393";
+          fillcolor="#d5d5d5";
+
+       labeljust="l"; 
+
+          spire_agent1[label=<<table border="0"><tr><td><b>SPIRE Agent A</b></td></tr><tr><td align="left"><font point-size="9">NodeAttestor: tpm</font></td></tr><tr><td align="left"><font point-size="9">WorkloadAttestor: systemd</font></td></tr><tr><td align="left"><font point-size="9">systemd: spire-agent@.service</font></td></tr></table>>,shape="record",style="rounded,solid,filled,bold",color="#82b366",fillcolor="#d5e8d4"]
+          spire_agent2[label=<<table border="0"><tr><td><b>SPIRE Agent B</b></td></tr><tr><td align="left"><font point-size="9">NodeAttestor: tpm</font></td></tr><tr><td align="left"><font point-size="9">WorkloadAttestor: systemd</font></td></tr><tr><td align="left"><font point-size="9">systemd: spire-agent@.service</font></td></tr></table>>,shape="record",style="rounded,solid,filled,bold",color="#82b366",fillcolor="#d5e8d4"]
+    subgraph cluster_tb {
+        label=""
+        style="invis"
+          spire_ha_agent[label=<<table border="0"><tr><td><b>SPIRE HA Agent</b></td></tr><tr><td align="left"><font point-size="9">systemd: spire-ha-agent@.service</font></td></tr></table>>,shape="record",style="rounded,solid,filled,bold",color="#82b366",fillcolor="#d5e8d4"]
+subgraph cluster_storage {
+          spire_ha_agent_state_a_b[label="Trust Bundle B", shape=note,style="rounded,dashed,filled,bold",fillcolor="#ffffff"]
+          spire_ha_agent_state_a[label="Trust Bundle A", shape=note,style="rounded,solid,filled,bold",fillcolor="#ffffff"]
+          spire_ha_agent_state_b_a[label="Trust Bundle A", shape=note,style="rounded,dashed,filled,bold",fillcolor="#ffffff"]
+          spire_ha_agent_state_b[label="Trust Bundle B", shape=note,style="rounded,solid,filled,bold",fillcolor="#ffffff"]
+}
+    }
+          sshd1[label="sshd",shape="box",style="rounded,solid,filled,bold",color="#d6b656",fillcolor="#fff2cc"]
+          kubelet1[label="kubelet",shape="box",style="rounded,solid,filled,bold",color="#d6b656",fillcolor="#fff2cc"]
+          dotdotdot1[label="...",shape="box",style="rounded,solid,filled,bold",color="#d6b656",fillcolor="#fff2cc"]
+          //k8s_spiffe_helper1[label=<<table border="0"><tr><td><b>K8s SPIFFE Helper</b></td></tr><tr><td align="left"><font point-size="9">systemd: k8s-spiffe-helper.service</font></td></tr><tr><td align="left"><font point-size="9">tool: spiffe-helper</font></td></tr></table>>,shape="box",style="rounded,solid,filled,bold",color="#d79b00",fillcolor="#ffe6cc"]
+      }
+  }
+  
+  spire_server_1 -> spire_agent1[dir=back]
+  spire_server_2 -> spire_agent2[dir=back]
+  spire_agent_b -> spire_server_2[constraint=false]
+  spire_agent_a -> spire_server_1[constraint=false]
+  spire_agent_b -> spire_trust_sync_b[dir=back]
+  spire_agent_a -> spire_trust_sync_a[dir=back]
+  spire_agent1 -> spire_ha_agent[dir=back]
+  spire_agent2 -> spire_ha_agent[dir=back]
+  spire_ha_agent -> sshd1[dir=back]
+  spire_ha_agent -> kubelet1[dir=back]
+  spire_ha_agent -> dotdotdot1[dir=back]
+//  spire_ha_agent -> spire_ha_agent_state[dir=both, constraint=false]
+ // spire_ha_agent_state_a -> spire_ha_agent_state_b 
+  spire_agent1 -> spire_ha_agent_state_a
+  spire_agent1 -> spire_ha_agent_state_a_b
+  spire_agent2 -> spire_ha_agent_state_b
+  spire_agent2 -> spire_ha_agent_state_b_a
+  spire_ha_agent_state_a -> spire_ha_agent
+  spire_ha_agent_state_a_b -> spire_ha_agent
+  spire_ha_agent_state_b -> spire_ha_agent
+  spire_ha_agent_state_b_a -> spire_ha_agent
+
+  spire_server_tb_b -> spire_server_1
+  spire_server_tb_a -> spire_server_2
+  spire_trust_sync_a -> spire_server_tb_a
+  spire_trust_sync_b -> spire_server_tb_b
+}
