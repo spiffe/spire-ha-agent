@@ -15,14 +15,14 @@ builds:
       - CGO_ENABLED=0
     goos:
       - linux
-    main: ./cmd
+    main: ./cmd/spire-ha-agent
     binary: spire-ha-agent
     id: spire-ha-agent
   - env:
       - CGO_ENABLED=0
     goos:
       - linux
-    main: ./cmd/spire-trust-sync-helper.go
+    main: ./cmd/spire-trust-sync-helper
     binary: spire-trust-sync-helper
     id: spire-trust-sync-helper
 

@@ -4,7 +4,7 @@ COPY . /build/
 WORKDIR /build
 
 RUN \
-  GOPROXY=direct CGO_ENABLED=0 go build cmd/main.go && \
+  GOPROXY=direct CGO_ENABLED=0 go build cmd/spire-ha-agent/main.go && \
   mv main spire-ha-agent
 
 FROM gcr.io/distroless/static-debian12
