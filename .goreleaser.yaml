@@ -15,7 +15,7 @@ builds:
       - CGO_ENABLED=0
     goos:
       - linux
-    main: ./cmd/main.go
+    main: ./cmd
     binary: spire-ha-agent
     id: spire-ha-agent
   - env:
@@ -30,6 +30,7 @@ archives:
   - format: tar.gz
     builds:
       - spire-ha-agent
+    id: spire-ha-agent
     # this name template makes the OS and Arch compatible with the results of `uname`.
     name_template: >-
       spire-ha-agent_
@@ -50,6 +51,7 @@ archives:
   - format: tar.gz
     builds:
       - spire-trust-sync-helper
+    id: spire-trust-sync-helper
     # this name template makes the OS and Arch compatible with the results of `uname`.
     name_template: >-
       spire-trust-sync-helper_
@@ -75,7 +77,8 @@ changelog:
       - "^test:"
 
 kos:
-  - repository: ghcr.io/spiffe/spire-ha-agent
+  - repositories:
+      - ghcr.io/spiffe/spire-ha-agent
     tags:
       - "{{.Version}}"
       - latest
