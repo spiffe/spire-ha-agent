@@ -62,6 +62,7 @@ archives:
       {{- if .Arm }}v{{ .Arm }}{{ end }}
     files:
       - systemd/spire-trust-sync@.service  
+      - config/trust-sync/default.conf
       - README.md
       - LICENSE
     # use zip for windows archives
