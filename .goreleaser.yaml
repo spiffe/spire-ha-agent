@@ -42,6 +42,7 @@ archives:
     files:
       - systemd/spire-ha-agent@.service
       - systemd/spire-socat@.service
+      - config/socat/*
       - README.md
       - LICENSE
     # use zip for windows archives
