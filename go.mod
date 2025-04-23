@@ -4,13 +4,13 @@ go 1.23.2
 
 require (
 	github.com/Microsoft/go-winio v0.6.2
-	github.com/go-jose/go-jose/v4 v4.0.4
+	github.com/go-jose/go-jose/v4 v4.0.5
 	github.com/mdlayher/vsock v1.2.1
 	github.com/sirupsen/logrus v1.9.3
 	github.com/spiffe/go-spiffe/v2 v2.4.0
 	github.com/spiffe/spire v1.11.0
 	github.com/spiffe/spire-api-sdk v1.11.0
-	github.com/stretchr/testify v1.9.0
+	github.com/stretchr/testify v1.10.0
 	golang.org/x/sys v0.31.0
 	google.golang.org/grpc v1.67.1
 	gopkg.in/yaml.v3 v3.0.1
