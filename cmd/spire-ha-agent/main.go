@@ -594,7 +594,11 @@ func main() {
 		}
 		lis, err = lf.ListenVSock(uint32(iport))
 	} else {
-		lis, err = lf.ListenUnix("unix", &net.UnixAddr{Name: "/var/run/spire/agent/sockets/main/public/api.sock", Net: "unix"})
+		socket := os.Getenv("SPIRE_HA_AGENT_SOCK")
+		if socket == "" {
+			socket = "/var/run/spire/agent/sockets/main/public/api.sock"
+		}
+		lis, err = lf.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
 	}
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
