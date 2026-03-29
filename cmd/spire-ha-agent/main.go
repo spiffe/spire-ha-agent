@@ -598,6 +598,7 @@ func main() {
 		if socket == "" {
 			socket = "/var/run/spire/agent/sockets/main/public/api.sock"
 		}
+		_ = os.Remove(socket)
 		lis, err = lf.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
 	}
 	if err != nil {
