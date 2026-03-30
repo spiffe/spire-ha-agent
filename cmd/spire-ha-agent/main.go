@@ -600,6 +600,9 @@ func main() {
 		}
 		_ = os.Remove(socket)
 		lis, err = lf.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
+		if err := os.Chmod(socket, 0777); err != nil {
+			log.Fatalf("failed to permission the socket: %v", err)
+		}
 	}
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
