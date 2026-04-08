@@ -119,6 +119,7 @@ kos:
       - linux/arm64
   - id: "spire-trust-sync"
     build: "spire-trust-sync"
+    bare: true
     repositories:
       - ghcr.io/spiffe/spire-trust-sync
     tags:
