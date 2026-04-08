@@ -34,7 +34,7 @@ builds:
     id: spire-trust-sync
 
 archives:
-  - format: ["tar.gz"]
+  - format: tar.gz
     builds:
       - spire-ha-agent
     id: spire-ha-agent
@@ -58,7 +58,7 @@ archives:
     format_overrides:
       - goos: windows
         format: zip
-  - format: ["tar.gz"]
+  - format: tar.gz
     builds:
       - spire-trust-sync-helper
     id: spire-trust-sync-helper
@@ -79,7 +79,7 @@ archives:
     format_overrides:
       - goos: windows
         format: zip
-  - format: ["tar.gz"]
+  - format: tar.gz
     builds:
       - spire-trust-sync
     id: spire-trust-sync
