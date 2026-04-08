@@ -25,6 +25,13 @@ builds:
     main: ./cmd/spire-trust-sync-helper
     binary: spire-trust-sync-helper
     id: spire-trust-sync-helper
+  - env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    main: ./cmd/spire-trust-sync
+    binary: spire-trust-sync
+    id: spire-trust-sync
 
 archives:
   - format: tar.gz
