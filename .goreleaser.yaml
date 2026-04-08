@@ -109,6 +109,8 @@ changelog:
 kos:
   - repositories:
       - ghcr.io/spiffe/spire-ha-agent
+    id: "spire-ha-agent"
+    build: "spire-ha-agent"
     tags:
       - "{{.Version}}"
       - latest
@@ -126,3 +128,6 @@ kos:
     tags:
       - "{{.Version}}"
       - latest
+    platforms:
+      - linux/amd64
+      - linux/arm64
