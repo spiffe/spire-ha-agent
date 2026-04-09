@@ -109,7 +109,8 @@ changelog:
 kos:
   - id: "spire-trust-sync"
     build: "spire-trust-sync"
-    bare: true
+    bare: false
+    base_import_paths: true
     preserve_import_paths: false
     repositories:
       - ghcr.io/spiffe/spire-trust-sync
