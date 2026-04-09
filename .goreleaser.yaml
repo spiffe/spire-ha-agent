@@ -121,7 +121,6 @@ kos:
       - linux/arm64
   - id: "spire-trust-sync"
     build: "spire-trust-sync"
-    main: ./cmd/spire-trust-sync
     bare: true
     preserve_import_paths: false
     repositories:
