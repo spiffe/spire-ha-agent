@@ -107,18 +107,6 @@ changelog:
       - "^test:"
 
 kos:
-  - repositories:
-      - ghcr.io/spiffe/spire-ha-agent
-    id: "spire-ha-agent"
-    build: "spire-ha-agent"
-    tags:
-      - "{{.Version}}"
-      - latest
-    bare: true
-    preserve_import_paths: false
-    platforms:
-      - linux/amd64
-      - linux/arm64
   - id: "spire-trust-sync"
     build: "spire-trust-sync"
     bare: true
@@ -128,6 +116,18 @@ kos:
     tags:
       - "{{.Version}}"
       - latest
+    platforms:
+      - linux/amd64
+      - linux/arm64
+  - repositories:
+      - ghcr.io/spiffe/spire-ha-agent
+    id: "spire-ha-agent"
+    build: "spire-ha-agent"
+    tags:
+      - "{{.Version}}"
+      - latest
+    bare: true
+    preserve_import_paths: false
     platforms:
       - linux/amd64
       - linux/arm64
