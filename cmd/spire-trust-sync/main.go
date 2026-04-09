@@ -154,7 +154,7 @@ func pushToServer(bundle *spiffebundle.Bundle, targetName string, serverSocket s
 	}
 
 	apiBundle := &types.Bundle{
-		TrustDomain:     bundle.TrustDomain().String(),
+		TrustDomain:     targetName,
 		X509Authorities: x509Authorities,
 		JwtAuthorities:  jwtAuthorities,
 	}
