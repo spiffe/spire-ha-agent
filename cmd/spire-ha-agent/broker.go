@@ -645,11 +645,13 @@ func setupBrokerClient(bs *brokerServer, clientName string, id int, brokerAddr s
 	}
 	bs.bundleLock.Unlock()
 
-	serverID, err := spiffeid.FromPath(cs.trustDomain, "/spire-ha-agent")
-	if err != nil {
-		log.Fatalf("%s: failed to build broker server ID: %v", clientName, err)
-	}
-	creds := grpccredentials.MTLSClientCredentials(source, source, tlsconfig.AuthorizeID(serverID))
+	// FIXME its hard to know what the remote id is.
+	// serverID, err := spiffeid.FromPath(cs.trustDomain, "/spire-ha-agent")
+	// if err != nil {
+	//	log.Fatalf("%s: failed to build broker server ID: %v", clientName, err)
+	// }
+	// creds := grpccredentials.MTLSClientCredentials(source, source, tlsconfig.AuthorizeID(serverID))
+	creds := grpccredentials.MTLSClientCredentials(source, source, tlsconfig.AuthorizeAny())
 	conn, err := grpc.NewClient(brokerTarget(brokerAddr), grpc.WithTransportCredentials(creds))
 	if err != nil {
 		log.Fatalf("%s: failed to create broker client for %s: %v", clientName, brokerAddr, err)
