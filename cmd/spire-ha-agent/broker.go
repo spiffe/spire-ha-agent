@@ -14,6 +14,7 @@ import (
 	"time"
 
 	jose "github.com/go-jose/go-jose/v4"
+	"github.com/spiffe/go-spiffe/v2/logger"
 	"github.com/spiffe/spire-ha-agent/pkg/peertracker"
 
 	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
@@ -33,6 +34,30 @@ import (
 )
 
 const haTrustDomainName = "spire-ha"
+
+// bundlesSettled reports whether the delivered bundle maps cover both
+// sides' authorities, i.e. workloads served from them can validate SVIDs
+// minted by either side (anything less is split brain). Each side loads the
+// other side's trust material into its own spire-ha bundle, so a single
+// side is complete once it delivers its local bundle plus its spire-ha
+// bundle; and both sides' local bundles together are complete with no
+// spire-ha bundle at all. In single mode there is no other side to cover.
+func bundlesSettled[V any](a, b map[string]V, localName string, multi bool) bool {
+	if !multi {
+		return len(a)+len(b) > 0
+	}
+	has := func(m map[string]V, name string) bool {
+		_, ok := m[name]
+		return ok
+	}
+	if has(a, localName) && has(a, haTrustDomainName) {
+		return true
+	}
+	if has(b, localName) && has(b, haTrustDomainName) {
+		return true
+	}
+	return has(a, localName) && has(b, localName)
+}
 
 type brokerX509BundleUpdated struct {
 	id      int
@@ -108,6 +133,11 @@ func (bs *brokerServer) localTDName() string {
 }
 
 func getBrokerX509SVIDs(dctx context.Context, pid int, client broker.APIClient, notify chan *broker.SubscribeToX509SVIDResponse) {
+	// A side that never finished setup (e.g. absent since our startup) has
+	// no client yet; the other side's pump serves the stream alone.
+	if client == nil {
+		return
+	}
 	for {
 		upstream, err := client.SubscribeToX509SVID(brokerMD(dctx), &broker.SubscribeToX509SVIDRequest{Reference: pidWorkloadReference(pid)})
 		if err != nil {
@@ -140,6 +170,9 @@ func getBrokerX509SVIDs(dctx context.Context, pid int, client broker.APIClient, 
 }
 
 func getBrokerX509Bundles(dctx context.Context, pid int, client broker.APIClient, notify chan *broker.SubscribeToX509BundlesResponse) {
+	if client == nil {
+		return
+	}
 	for {
 		upstream, err := client.SubscribeToX509Bundles(brokerMD(dctx), &broker.SubscribeToX509BundlesRequest{Reference: pidWorkloadReference(pid)})
 		if err != nil {
@@ -171,6 +204,9 @@ func getBrokerX509Bundles(dctx context.Context, pid int, client broker.APIClient
 }
 
 func getBrokerJWTBundles(dctx context.Context, pid int, client broker.APIClient, notify chan *broker.SubscribeToJWTBundlesResponse) {
+	if client == nil {
+		return
+	}
 	for {
 		upstream, err := client.SubscribeToJWTBundles(brokerMD(dctx), &broker.SubscribeToJWTBundlesRequest{Reference: pidWorkloadReference(pid)})
 		if err != nil {
@@ -202,13 +238,20 @@ func getBrokerJWTBundles(dctx context.Context, pid int, client broker.APIClient,
 }
 
 func getBrokerJWT(dctx context.Context, pid int, audience []string, spiffeID string, client broker.APIClient, notify chan *broker.FetchJWTSVIDResponse) {
-	resp, err := client.FetchJWTSVID(brokerMD(dctx), &broker.FetchJWTSVIDRequest{
-		Reference: pidWorkloadReference(pid),
-		Audience:  audience,
-		SpiffeId:  spiffeID,
-	})
-	if err != nil {
-		log.Printf("broker jwt %d upstream error: %v", pid, err)
+	var resp *broker.FetchJWTSVIDResponse
+	// A side that never finished setup has no client yet; report the nil
+	// response so the caller counts it as a failed side.
+	if client != nil {
+		var err error
+		resp, err = client.FetchJWTSVID(brokerMD(dctx), &broker.FetchJWTSVIDRequest{
+			Reference: pidWorkloadReference(pid),
+			Audience:  audience,
+			SpiffeId:  spiffeID,
+		})
+		if err != nil {
+			log.Printf("broker jwt %d upstream error: %v", pid, err)
+			resp = nil
+		}
 	}
 	select {
 	case notify <- resp:
@@ -619,11 +662,20 @@ func setupBrokerClient(bs *brokerServer, clientName string, id int, brokerAddr s
 	for {
 		var err error
 		log.Printf("%s: obtaining our identity from %s", clientName, workloadAddr)
-		source, err = workloadapi.NewX509Source(context.Background(), workloadapi.WithClientOptions(workloadapi.WithAddr(workloadAddr)))
+		// NewX509Source blocks until an SVID is actually issued, silently
+		// retrying every failure (missing socket, no identity issued, ...)
+		// internally. Bound each attempt and hand go-spiffe a real logger so
+		// a side that won't issue us an identity shows up in the logs
+		// instead of hanging silently forever. The timeout only bounds
+		// initialization; the source's rotation watch runs on its own
+		// background context.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		source, err = workloadapi.NewX509Source(ctx, workloadapi.WithClientOptions(workloadapi.WithAddr(workloadAddr), workloadapi.WithLogger(logger.Std)))
+		cancel()
 		if err == nil {
 			break
 		}
-		log.Printf("%s: failed to create X509 source from %s: %v", clientName, workloadAddr, err)
+		log.Printf("%s: failed to obtain identity from %s: %v", clientName, workloadAddr, err)
 		time.Sleep(5 * time.Second)
 	}
 	// The source is intentionally never closed: it keeps rotating our SVID
@@ -736,33 +788,6 @@ func brokerMain() {
 	var jwtWg sync.WaitGroup
 	wg.Add(1)
 	jwtWg.Add(1)
-	lf := &peertracker.ListenerFactory{}
-	var lis *peertracker.Listener
-	var err error
-	if os.Getenv("SPIRE_HA_AGENT_VSOCK") == "enabled" {
-		port := os.Getenv("SPIRE_HA_AGENT_PORT")
-		if port == "" {
-			port = "997"
-		}
-		iport, err := strconv.Atoi(port)
-		if err != nil {
-			log.Fatalf("failed to parse port: %v", err)
-		}
-		lis, err = lf.ListenVSock(uint32(iport))
-	} else {
-		socket := os.Getenv("SPIRE_HA_AGENT_SOCK")
-		if socket == "" {
-			socket = "/var/run/spire/agent/sockets/main/public/api.sock"
-		}
-		_ = os.Remove(socket)
-		lis, err = lf.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
-		if err := os.Chmod(socket, 0777); err != nil {
-			log.Fatalf("failed to permission the socket: %v", err)
-		}
-	}
-	if err != nil {
-		log.Fatalf("failed to listen: %v", err)
-	}
 	bs := &brokerServer{
 		multi:            os.Getenv("SPIRE_HA_AGENT_SINGLE") != "enabled",
 		x509BundleUpdate: make(chan brokerX509BundleUpdated),
@@ -820,10 +845,10 @@ func brokerMain() {
 			}
 			bs.clients[u.id].x509Bundles = u.bundles
 
-			totalBundles := len(bs.clients[0].x509Bundles) + len(bs.clients[1].x509Bundles)
-			if totalBundles > 1 || !bs.multi {
+			localName := bs.localTDName()
+			if bundlesSettled(bs.clients[0].x509Bundles, bs.clients[1].x509Bundles, localName, bs.multi) {
+				totalBundles := len(bs.clients[0].x509Bundles) + len(bs.clients[1].x509Bundles)
 				log.Printf("We got %d x509 bundles\n", totalBundles)
-				localName := bs.localTDName()
 				rawBundles := make(map[string][]byte)
 				names := make(map[string]bool)
 				for i := range bs.clients {
@@ -894,10 +919,10 @@ func brokerMain() {
 			}
 			bs.clients[u.id].jwtBundles = u.bundles
 
-			totalBundles := len(bs.clients[0].jwtBundles) + len(bs.clients[1].jwtBundles)
-			if totalBundles > 1 || !bs.multi {
+			localName := bs.localTDName()
+			if bundlesSettled(bs.clients[0].jwtBundles, bs.clients[1].jwtBundles, localName, bs.multi) {
+				totalBundles := len(bs.clients[0].jwtBundles) + len(bs.clients[1].jwtBundles)
 				log.Printf("We got %d jwt bundles\n", totalBundles)
-				localName := bs.localTDName()
 				rawBundles := make(map[string][]byte)
 				names := make(map[string]bool)
 				for i := range bs.clients {
@@ -961,6 +986,38 @@ func brokerMain() {
 	wg.Wait()
 	jwtWg.Wait()
 	log.Printf("Startup settled")
+
+	// The workload API socket is created only now that the server can
+	// actually answer on it. A socket that exists but is never served turns
+	// every workload's dial into a silent hang until its own timeout;
+	// connection refused is retried cleanly and keeps readiness observable.
+	lf := &peertracker.ListenerFactory{}
+	var lis *peertracker.Listener
+	var err error
+	if os.Getenv("SPIRE_HA_AGENT_VSOCK") == "enabled" {
+		port := os.Getenv("SPIRE_HA_AGENT_PORT")
+		if port == "" {
+			port = "997"
+		}
+		iport, err := strconv.Atoi(port)
+		if err != nil {
+			log.Fatalf("failed to parse port: %v", err)
+		}
+		lis, err = lf.ListenVSock(uint32(iport))
+	} else {
+		socket := os.Getenv("SPIRE_HA_AGENT_SOCK")
+		if socket == "" {
+			socket = "/var/run/spire/agent/sockets/main/public/api.sock"
+		}
+		_ = os.Remove(socket)
+		lis, err = lf.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
+		if err := os.Chmod(socket, 0777); err != nil {
+			log.Fatalf("failed to permission the socket: %v", err)
+		}
+	}
+	if err != nil {
+		log.Fatalf("failed to listen: %v", err)
+	}
 
 	workload.RegisterSpiffeWorkloadAPIServer(s, bs)
 	if err := s.Serve(lis); err != nil {

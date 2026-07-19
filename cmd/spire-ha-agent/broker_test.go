@@ -233,6 +233,10 @@ type fakeSide struct {
 	localKid   string
 	haKid      string
 	otherKid   string
+
+	// optional overrides for the canned bundle responses (nil => defaults)
+	x509Bundles map[string][]byte
+	jwtBundles  map[string][]byte
 }
 
 func startFakeSide(t *testing.T, s *fakeSide) {
@@ -288,6 +292,12 @@ func startFakeSide(t *testing.T, s *fakeSide) {
 			},
 		},
 		jwtToken: s.jwtToken,
+	}
+	if s.x509Bundles != nil {
+		fb.bundleResp = &broker.SubscribeToX509BundlesResponse{Bundles: s.x509Bundles}
+	}
+	if s.jwtBundles != nil {
+		fb.jwtBundles = &broker.SubscribeToJWTBundlesResponse{Bundles: s.jwtBundles}
 	}
 
 	// broker server identity: spiffe://example.org/spire-ha-agent
