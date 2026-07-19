@@ -1,11 +1,10 @@
-FROM docker.io/library/golang:1.23.2 as build
+FROM docker.io/library/golang:1.24.0 as build
 
 COPY . /build/
 WORKDIR /build
 
 RUN \
-  GOPROXY=direct CGO_ENABLED=0 go build cmd/spire-ha-agent/main.go && \
-  mv main spire-ha-agent
+  GOPROXY=direct CGO_ENABLED=0 go build -o spire-ha-agent ./cmd/spire-ha-agent
 
 FROM gcr.io/distroless/static-debian12
 COPY --from=build /build/spire-ha-agent /usr/bin/spire-ha-agent

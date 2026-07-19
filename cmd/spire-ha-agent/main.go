@@ -578,7 +578,15 @@ func main() {
 	jwtInitBundle := true
 	wg.Add(1)
 	jwtWg.Add(1)
+	mode := flag.String("mode", "delegated", `upstream API mode: "delegated" or "broker"`)
 	flag.Parse()
+	if *mode == "broker" {
+		brokerMain()
+		return
+	}
+	if *mode != "delegated" {
+		log.Fatalf("unknown -mode %q (expected \"delegated\" or \"broker\")", *mode)
+	}
 	lf := &peertracker.ListenerFactory{}
         var lis *peertracker.Listener
         var err error
@@ -731,7 +739,7 @@ func main() {
 				os.Exit(1)
 			}
 			if _, ok := u.bundle["spiffe://spire-ha"]; bl == 2 && !ok {
-				log.Printf("spire-ha trust bundle not found in JWT trust bundle. Please reconfigure the spire-ha-agent entry. %s\n", u.bundle)
+				log.Printf("spire-ha trust bundle not found in JWT trust bundle. Please reconfigure the spire-ha-agent entry. %v\n", u.bundle)
 				os.Exit(1)
 			}
 			for tdSTR, bundle := range u.bundle {
