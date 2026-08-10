@@ -84,9 +84,15 @@ type brokerServer struct {
 	rawJwtBundles    map[string][]byte
 	bundleChan       chan struct{}
 	jwtBundleChan    chan struct{}
-	bundleLock       sync.RWMutex
-	localTD          spiffeid.TrustDomain
-	clients          [2]brokerClientSet
+	// Closed and replaced whenever an upstream side's client becomes
+	// available, so streams opened while a side was absent can start that
+	// side's pump instead of staying pinned to whoever was up at open time.
+	// Unlike bundleChan this is created up front: it fires after startup has
+	// settled, so a handler that captured a nil channel would never wake.
+	clientsChan chan struct{}
+	bundleLock  sync.RWMutex
+	localTD     spiffeid.TrustDomain
+	clients     [2]brokerClientSet
 	workload.UnimplementedSpiffeWorkloadAPIServer
 	multi bool
 }
@@ -124,6 +130,59 @@ func (bs *brokerServer) currentJWTBundleChan() chan struct{} {
 	bs.bundleLock.RLock()
 	defer bs.bundleLock.RUnlock()
 	return bs.jwtBundleChan
+}
+
+func (bs *brokerServer) currentClientsChan() chan struct{} {
+	bs.bundleLock.RLock()
+	defer bs.bundleLock.RUnlock()
+	return bs.clientsChan
+}
+
+// The upstream clients as of now. A side that has not finished setup yet is
+// nil; callers that hold a long-lived stream must re-read this on a
+// currentClientsChan wake rather than trusting the value they opened with.
+func (bs *brokerServer) upstreamClients() (broker.APIClient, broker.APIClient) {
+	bs.bundleLock.RLock()
+	defer bs.bundleLock.RUnlock()
+	return bs.clients[0].client, bs.clients[1].client
+}
+
+// Which upstream sides currently have a client, for logging: none, a, b or
+// a+b. In single mode only side a exists.
+func (bs *brokerServer) sidesAvailable() string {
+	c0, c1 := bs.upstreamClients()
+	switch {
+	case c0 != nil && c1 != nil:
+		return "a+b"
+	case c0 != nil:
+		return "a"
+	case c1 != nil:
+		return "b"
+	default:
+		return "none"
+	}
+}
+
+// Starts the upstream pump for every side that has a client and does not
+// already have one on this stream, recording it in started. Streams call
+// this when they open and again on every currentClientsChan wake, so a side
+// that finishes setup after the stream opened joins it rather than being
+// ignored for the life of the stream. Reports whether anything started.
+func (bs *brokerServer) startPumps(started *[2]bool, start func(id int, client broker.APIClient)) bool {
+	c0, c1 := bs.upstreamClients()
+	joined := false
+	for id, client := range [2]broker.APIClient{c0, c1} {
+		if id == 1 && !bs.multi {
+			continue
+		}
+		if client == nil || started[id] {
+			continue
+		}
+		started[id] = true
+		start(id, client)
+		joined = true
+	}
+	return joined
 }
 
 func (bs *brokerServer) localTDName() string {
@@ -424,20 +483,37 @@ func (s *brokerServer) FetchX509SVID(req *workload.X509SVIDRequest, downstream w
 
 	chan1 := make(chan *broker.SubscribeToX509SVIDResponse)
 	chan2 := make(chan *broker.SubscribeToX509SVIDResponse)
-	go getBrokerX509SVIDs(dctx, pid, s.clients[0].client, chan1)
-	if s.multi {
-		go getBrokerX509SVIDs(dctx, pid, s.clients[1].client, chan2)
+	var started [2]bool
+	startPump := func(id int, client broker.APIClient) {
+		if id == 0 {
+			go getBrokerX509SVIDs(dctx, pid, client, chan1)
+		} else {
+			go getBrokerX509SVIDs(dctx, pid, client, chan2)
+		}
 	}
+	clientsChan := s.currentClientsChan()
+	s.startPumps(&started, startPump)
+	log.Printf("broker x509fetch pid=%d: upstream sides available: %s", pid, s.sidesAvailable())
 
 	var resp *broker.SubscribeToX509SVIDResponse
-	select {
-	case <-dctx.Done():
-		log.Printf("broker x509fetch client disconnected\n")
-		return nil
-	case resp = <-chan1:
-		log.Printf("broker x509fetch got new certs\n")
-	case resp = <-chan2:
-		log.Printf("broker x509fetch got new certs2\n")
+	for resp == nil {
+		select {
+		case <-dctx.Done():
+			log.Printf("broker x509fetch client disconnected\n")
+			return nil
+		case resp = <-chan1:
+			log.Printf("broker x509fetch got new certs\n")
+		case resp = <-chan2:
+			log.Printf("broker x509fetch got new certs2\n")
+		case <-clientsChan:
+			// A side finished setup after we opened. Without this the only
+			// side we ever ask is whoever was up at open time, so a
+			// workload only the late side knows about never gets an answer.
+			clientsChan = s.currentClientsChan()
+			if s.startPumps(&started, startPump) {
+				log.Printf("broker x509fetch pid=%d: upstream side joined, starting pump (now %s)", pid, s.sidesAvailable())
+			}
+		}
 	}
 
 	bundleChan := s.currentX509BundleChan()
@@ -472,6 +548,11 @@ func (s *brokerServer) FetchX509SVID(req *workload.X509SVIDRequest, downstream w
 					diff = true
 				}
 				log.Printf("diff: %t", diff)
+			case <-clientsChan:
+				clientsChan = s.currentClientsChan()
+				if s.startPumps(&started, startPump) {
+					log.Printf("broker x509fetch pid=%d: upstream side joined, starting pump (now %s)", pid, s.sidesAvailable())
+				}
 			}
 			if diff {
 				break
@@ -491,20 +572,34 @@ func (s *brokerServer) FetchX509Bundles(req *workload.X509BundlesRequest, downst
 
 	chan1 := make(chan *broker.SubscribeToX509BundlesResponse)
 	chan2 := make(chan *broker.SubscribeToX509BundlesResponse)
-	go getBrokerX509Bundles(dctx, pid, s.clients[0].client, chan1)
-	if s.multi {
-		go getBrokerX509Bundles(dctx, pid, s.clients[1].client, chan2)
+	var started [2]bool
+	startPump := func(id int, client broker.APIClient) {
+		if id == 0 {
+			go getBrokerX509Bundles(dctx, pid, client, chan1)
+		} else {
+			go getBrokerX509Bundles(dctx, pid, client, chan2)
+		}
 	}
+	clientsChan := s.currentClientsChan()
+	s.startPumps(&started, startPump)
+	log.Printf("broker x509bundles pid=%d: upstream sides available: %s", pid, s.sidesAvailable())
 
 	var resp1, resp2 *broker.SubscribeToX509BundlesResponse
-	select {
-	case <-dctx.Done():
-		log.Printf("broker x509bundles client disconnected\n")
-		return nil
-	case resp1 = <-chan1:
-		log.Printf("broker x509bundles got new bundles\n")
-	case resp2 = <-chan2:
-		log.Printf("broker x509bundles got new bundles2\n")
+	for resp1 == nil && resp2 == nil {
+		select {
+		case <-dctx.Done():
+			log.Printf("broker x509bundles client disconnected\n")
+			return nil
+		case resp1 = <-chan1:
+			log.Printf("broker x509bundles got new bundles\n")
+		case resp2 = <-chan2:
+			log.Printf("broker x509bundles got new bundles2\n")
+		case <-clientsChan:
+			clientsChan = s.currentClientsChan()
+			if s.startPumps(&started, startPump) {
+				log.Printf("broker x509bundles pid=%d: upstream side joined, starting pump (now %s)", pid, s.sidesAvailable())
+			}
+		}
 	}
 
 	bundleChan := s.currentX509BundleChan()
@@ -529,6 +624,11 @@ func (s *brokerServer) FetchX509Bundles(req *workload.X509BundlesRequest, downst
 			case <-bundleChan:
 				log.Printf("broker x509bundles ca refreshed\n")
 				bundleChan = s.currentX509BundleChan()
+			case <-clientsChan:
+				clientsChan = s.currentClientsChan()
+				if s.startPumps(&started, startPump) {
+					log.Printf("broker x509bundles pid=%d: upstream side joined, starting pump (now %s)", pid, s.sidesAvailable())
+				}
 			}
 			nb := s.brokerBundlesToWorkloadBundleResponse(resp1, resp2)
 			if !proto.Equal(bundles, nb) {
@@ -549,12 +649,15 @@ func (s *brokerServer) FetchJWTSVID(dctx context.Context, downstream *workload.J
 	log.Printf("broker FetchJWTSVID")
 	pid := dctx.Value(callerPIDKey{}).(int)
 
+	// Unary, so the clients are re-read on every call and a late side is
+	// picked up without any of the stream bookkeeping below.
+	c0, c1 := s.upstreamClients()
 	failLimit := 1
 	chan1 := make(chan *broker.FetchJWTSVIDResponse)
-	go getBrokerJWT(dctx, pid, downstream.Audience, downstream.SpiffeId, s.clients[0].client, chan1)
+	go getBrokerJWT(dctx, pid, downstream.Audience, downstream.SpiffeId, c0, chan1)
 	if s.multi {
 		failLimit = 2
-		go getBrokerJWT(dctx, pid, downstream.Audience, downstream.SpiffeId, s.clients[1].client, chan1)
+		go getBrokerJWT(dctx, pid, downstream.Audience, downstream.SpiffeId, c1, chan1)
 	}
 
 	var count int
@@ -597,20 +700,34 @@ func (s *brokerServer) FetchJWTBundles(req *workload.JWTBundlesRequest, downstre
 
 	chan1 := make(chan *broker.SubscribeToJWTBundlesResponse)
 	chan2 := make(chan *broker.SubscribeToJWTBundlesResponse)
-	go getBrokerJWTBundles(dctx, pid, s.clients[0].client, chan1)
-	if s.multi {
-		go getBrokerJWTBundles(dctx, pid, s.clients[1].client, chan2)
+	var started [2]bool
+	startPump := func(id int, client broker.APIClient) {
+		if id == 0 {
+			go getBrokerJWTBundles(dctx, pid, client, chan1)
+		} else {
+			go getBrokerJWTBundles(dctx, pid, client, chan2)
+		}
 	}
+	clientsChan := s.currentClientsChan()
+	s.startPumps(&started, startPump)
+	log.Printf("broker jwtbundles pid=%d: upstream sides available: %s", pid, s.sidesAvailable())
 
 	var resp1, resp2 *broker.SubscribeToJWTBundlesResponse
-	select {
-	case <-dctx.Done():
-		log.Printf("broker jwtbundles client disconnected\n")
-		return nil
-	case resp1 = <-chan1:
-		log.Printf("broker jwtbundles got new bundles\n")
-	case resp2 = <-chan2:
-		log.Printf("broker jwtbundles got new bundles2\n")
+	for resp1 == nil && resp2 == nil {
+		select {
+		case <-dctx.Done():
+			log.Printf("broker jwtbundles client disconnected\n")
+			return nil
+		case <-clientsChan:
+			clientsChan = s.currentClientsChan()
+			if s.startPumps(&started, startPump) {
+				log.Printf("broker jwtbundles pid=%d: upstream side joined, starting pump (now %s)", pid, s.sidesAvailable())
+			}
+		case resp1 = <-chan1:
+			log.Printf("broker jwtbundles got new bundles\n")
+		case resp2 = <-chan2:
+			log.Printf("broker jwtbundles got new bundles2\n")
+		}
 	}
 
 	bundleChan := s.currentJWTBundleChan()
@@ -635,6 +752,11 @@ func (s *brokerServer) FetchJWTBundles(req *workload.JWTBundlesRequest, downstre
 			case <-bundleChan:
 				log.Printf("broker jwtbundles ca refreshed\n")
 				bundleChan = s.currentJWTBundleChan()
+			case <-clientsChan:
+				clientsChan = s.currentClientsChan()
+				if s.startPumps(&started, startPump) {
+					log.Printf("broker jwtbundles pid=%d: upstream side joined, starting pump (now %s)", pid, s.sidesAvailable())
+				}
 			}
 			nb := s.brokerJWTBundlesToWorkloadResponse(resp1, resp2)
 			if !proto.Equal(bundles, nb) {
@@ -708,7 +830,15 @@ func setupBrokerClient(bs *brokerServer, clientName string, id int, brokerAddr s
 	if err != nil {
 		log.Fatalf("%s: failed to create broker client for %s: %v", clientName, brokerAddr, err)
 	}
+	// Publishing the client and waking the waiters happen under the same
+	// lock the stream handlers read it with, so a stream that wakes is
+	// guaranteed to observe the client that woke it.
+	bs.bundleLock.Lock()
 	cs.client = broker.NewAPIClient(conn)
+	close(bs.clientsChan)
+	bs.clientsChan = make(chan struct{})
+	bs.bundleLock.Unlock()
+	log.Printf("%s: client ready. upstream sides available: %s", clientName, bs.sidesAvailable())
 
 	// Bundle subscriptions are scoped to a workload; we subscribe as
 	// ourselves, so the spire-ha-agent's own registration entry (and its
@@ -792,6 +922,7 @@ func brokerMain() {
 		multi:            os.Getenv("SPIRE_HA_AGENT_SINGLE") != "enabled",
 		x509BundleUpdate: make(chan brokerX509BundleUpdated),
 		jwtBundleUpdate:  make(chan brokerJWTBundleUpdated),
+		clientsChan:      make(chan struct{}),
 	}
 
 	unaryInterceptor, streamInterceptor := middleware.Interceptors(middleware.Chain(
@@ -985,7 +1116,10 @@ func brokerMain() {
 
 	wg.Wait()
 	jwtWg.Wait()
-	log.Printf("Startup settled")
+	// A lone side satisfies bundlesSettled when it carries the other side's
+	// authorities in its spire-ha bundle, so say outright which sides we
+	// actually have rather than leaving it to be inferred from the pump logs.
+	log.Printf("Startup settled. upstream sides available: %s", bs.sidesAvailable())
 
 	// The workload API socket is created only now that the server can
 	// actually answer on it. A socket that exists but is never served turns
