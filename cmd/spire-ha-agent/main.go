@@ -322,6 +322,21 @@ func get_jwt(dctx context.Context, pid int, audience []string, delegatedClient a
 	*notify <- resp
 }
 
+// jwtSVIDsFromDelegated converts a delegated identity API response into the
+// Workload API form. Each SVID keeps its own SPIFFE ID and hint, so a workload
+// entitled to more than one identity can tell them apart.
+func jwtSVIDsFromDelegated(resp *agentdelegated.FetchJWTSVIDsResponse) []*workload.JWTSVID {
+	svids := make([]*workload.JWTSVID, 0, len(resp.GetSvids()))
+	for _, s := range resp.GetSvids() {
+		svids = append(svids, &workload.JWTSVID{
+			SpiffeId: fmt.Sprintf("spiffe://%s%s", s.GetId().GetTrustDomain(), s.GetId().GetPath()),
+			Svid:     s.GetToken(),
+			Hint:     s.GetHint(),
+		})
+	}
+	return svids
+}
+
 // Fetch JWT-SVIDs for all SPIFFE identities the workload is entitled to,
 // for the requested audience. If an optional SPIFFE ID is requested, only
 // the JWT-SVID for that SPIFFE ID is returned.
@@ -339,7 +354,6 @@ func (s *server) FetchJWTSVID(dctx context.Context, downstream *workload.JWTSVID
 	}
 
 //FIXME  in the request,  string spiffe_id = 2;
-//reponse hint? no delegated api equiv.
 
 	for {
 		select {
@@ -359,14 +373,7 @@ func (s *server) FetchJWTSVID(dctx context.Context, downstream *workload.JWTSVID
 		}
 	}
 
-	svids := make([]*workload.JWTSVID, 0)
-	for _, s := range resp.Svids {
-		id := fmt.Sprintf("spiffe://%s%s", resp.Svids[0].Id.TrustDomain, resp.Svids[0].Id.Path)
-		e := &workload.JWTSVID{SpiffeId: id, Svid: s.Token}
-		//FIXME how might we return a hint? Not returned from the delegated api
-		svids = append(svids, e)
-	}
-	res := &workload.JWTSVIDResponse{Svids: svids}
+	res := &workload.JWTSVIDResponse{Svids: jwtSVIDsFromDelegated(resp)}
 	log.Printf("wark3 %s\n", res)
 	return res, nil
 }
