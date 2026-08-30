@@ -12,8 +12,9 @@ package main
 //
 // Then runs brokerMain in-process pointed at the fakes and verifies, via the
 // raw workload API on the downstream socket:
-//   - FetchX509SVID: bundle = union of A-CA, B-CA, HA-CA-A, HA-CA-B,
-//     federated bundle for other.org = both sides' CAs, spire-ha not exposed
+//   - FetchX509SVID: bundle = union of A-CA, B-CA, HA-CA-A, HA-CA-B;
+//     federated bundle for other.org passed through from the answering side
+//     (never unioned), spire-ha not exposed
 //   - FetchX509Bundles: example.org -> 4 certs, other.org -> 2 certs
 //   - FetchJWTBundles: example.org kids = {a1,b1,ha-a,ha-b}, other.org = {o-a,o-b}
 //   - FetchJWTSVID: passthrough of a canned token and hint
@@ -32,6 +33,8 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -45,6 +48,7 @@ import (
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -148,12 +152,52 @@ func (f *fakeWorkloadAPI) FetchX509SVID(req *workload.X509SVIDRequest, stream wo
 
 // ---- fake broker ----
 
+// The fake supports failure injection (fail => every method returns
+// Unavailable) and pushing updated responses to all active streams via a
+// close-and-replace broadcast channel, so tests can simulate a side erroring
+// or rotating its material mid-stream.
 type fakeBroker struct {
 	broker.UnimplementedAPIServer
+	mu         sync.Mutex
+	fail       bool
 	svidResp   *broker.SubscribeToX509SVIDResponse
 	bundleResp *broker.SubscribeToX509BundlesResponse
 	jwtBundles *broker.SubscribeToJWTBundlesResponse
 	jwtToken   string
+	changed    chan struct{}
+}
+
+func (f *fakeBroker) broadcastLocked() {
+	close(f.changed)
+	f.changed = make(chan struct{})
+}
+
+func (f *fakeBroker) setFail(v bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fail = v
+	f.broadcastLocked()
+}
+
+func (f *fakeBroker) setSVIDResp(r *broker.SubscribeToX509SVIDResponse) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.svidResp = r
+	f.broadcastLocked()
+}
+
+func (f *fakeBroker) setBundleResp(r *broker.SubscribeToX509BundlesResponse) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.bundleResp = r
+	f.broadcastLocked()
+}
+
+func (f *fakeBroker) setJWTBundles(r *broker.SubscribeToJWTBundlesResponse) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.jwtBundles = r
+	f.broadcastLocked()
 }
 
 func checkBrokerMD(ctx context.Context) error {
@@ -168,42 +212,93 @@ func (f *fakeBroker) SubscribeToX509SVID(req *broker.SubscribeToX509SVIDRequest,
 	if err := checkBrokerMD(stream.Context()); err != nil {
 		return err
 	}
-	if err := stream.Send(f.svidResp); err != nil {
-		return err
+	var last *broker.SubscribeToX509SVIDResponse
+	for {
+		f.mu.Lock()
+		fail, resp, ch := f.fail, f.svidResp, f.changed
+		f.mu.Unlock()
+		if fail {
+			return status.Error(codes.Unavailable, "injected failure")
+		}
+		if resp != last {
+			if err := stream.Send(resp); err != nil {
+				return err
+			}
+			last = resp
+		}
+		select {
+		case <-stream.Context().Done():
+			return nil
+		case <-ch:
+		}
 	}
-	<-stream.Context().Done()
-	return nil
 }
 
 func (f *fakeBroker) SubscribeToX509Bundles(req *broker.SubscribeToX509BundlesRequest, stream broker.API_SubscribeToX509BundlesServer) error {
 	if err := checkBrokerMD(stream.Context()); err != nil {
 		return err
 	}
-	if err := stream.Send(f.bundleResp); err != nil {
-		return err
+	var last *broker.SubscribeToX509BundlesResponse
+	for {
+		f.mu.Lock()
+		fail, resp, ch := f.fail, f.bundleResp, f.changed
+		f.mu.Unlock()
+		if fail {
+			return status.Error(codes.Unavailable, "injected failure")
+		}
+		if resp != last {
+			if err := stream.Send(resp); err != nil {
+				return err
+			}
+			last = resp
+		}
+		select {
+		case <-stream.Context().Done():
+			return nil
+		case <-ch:
+		}
 	}
-	<-stream.Context().Done()
-	return nil
 }
 
 func (f *fakeBroker) SubscribeToJWTBundles(req *broker.SubscribeToJWTBundlesRequest, stream broker.API_SubscribeToJWTBundlesServer) error {
 	if err := checkBrokerMD(stream.Context()); err != nil {
 		return err
 	}
-	if err := stream.Send(f.jwtBundles); err != nil {
-		return err
+	var last *broker.SubscribeToJWTBundlesResponse
+	for {
+		f.mu.Lock()
+		fail, resp, ch := f.fail, f.jwtBundles, f.changed
+		f.mu.Unlock()
+		if fail {
+			return status.Error(codes.Unavailable, "injected failure")
+		}
+		if resp != last {
+			if err := stream.Send(resp); err != nil {
+				return err
+			}
+			last = resp
+		}
+		select {
+		case <-stream.Context().Done():
+			return nil
+		case <-ch:
+		}
 	}
-	<-stream.Context().Done()
-	return nil
 }
 
 func (f *fakeBroker) FetchJWTSVID(ctx context.Context, req *broker.FetchJWTSVIDRequest) (*broker.FetchJWTSVIDResponse, error) {
 	if err := checkBrokerMD(ctx); err != nil {
 		return nil, err
 	}
+	f.mu.Lock()
+	fail, token := f.fail, f.jwtToken
+	f.mu.Unlock()
+	if fail {
+		return nil, status.Error(codes.Unavailable, "injected failure")
+	}
 	return &broker.FetchJWTSVIDResponse{Svids: []*broker.JWTSVID{{
 		SpiffeId: "spiffe://example.org/myworkload",
-		Svid:     f.jwtToken,
+		Svid:     token,
 		Hint:     "internal",
 	}}}, nil
 }
@@ -223,25 +318,37 @@ func testListen(t *testing.T, path string) net.Listener {
 }
 
 type fakeSide struct {
-	name       string
-	ca         *testCA
-	haCA       *testCA
-	otherCA    *testCA
-	wlSock     string
-	brokerSock string
-	jwtToken   string
-	localKid   string
-	haKid      string
-	otherKid   string
+	name    string
+	ca      *testCA
+	haCA    *testCA
+	otherCA *testCA
+	// The federated bundle handed out in the SVID response, deliberately a
+	// different authority from otherCA (which the bundle subscription
+	// serves) so tests can tell a value passed through from the caller's own
+	// response apart from one substituted out of the merged global map.
+	otherSVIDCA *testCA
+	wlSock      string
+	brokerSock  string
+	jwtToken    string
+	localKid    string
+	haKid       string
+	otherKid    string
 
-	// optional overrides for the canned bundle responses (nil => defaults)
-	x509Bundles map[string][]byte
-	jwtBundles  map[string][]byte
+	// failure injection controls
+	skipBroker      bool // don't start the broker server (dead broker socket)
+	skipWorkloadAPI bool // don't start the workload API (with skipBroker: side absent)
+	fb              *fakeBroker
+	wlServer        *grpc.Server
+	brokerServer    *grpc.Server
+	brokerCreds     credentials.TransportCredentials
 }
 
 func startFakeSide(t *testing.T, s *fakeSide) {
 	t.Helper()
 	td := spiffeid.RequireTrustDomainFromString("example.org")
+	if s.otherSVIDCA == nil {
+		s.otherSVIDCA = newTestCA(t, "OTHER-SVID-CA-"+strings.TrimPrefix(s.name, "broker"))
+	}
 
 	// ha-agent's own client SVID, served by the fake workload API
 	clientID := spiffeid.RequireFromPath(td, "/ha-agent")
@@ -254,16 +361,18 @@ func startFakeSide(t *testing.T, s *fakeSide) {
 			Bundle:      s.ca.cert.Raw,
 		}},
 	}}
-	wlServer := grpc.NewServer()
-	workload.RegisterSpiffeWorkloadAPIServer(wlServer, wl)
-	go wlServer.Serve(testListen(t, s.wlSock))
-	t.Cleanup(wlServer.Stop)
+	if !s.skipWorkloadAPI {
+		s.wlServer = grpc.NewServer()
+		workload.RegisterSpiffeWorkloadAPIServer(s.wlServer, wl)
+		go s.wlServer.Serve(testListen(t, s.wlSock))
+		t.Cleanup(s.wlServer.Stop)
+	}
 
 	// canned workload SVID handed out by the broker
 	workloadID := spiffeid.RequireFromPath(td, "/myworkload")
 	wlLeaf := s.ca.issue(t, workloadID)
 
-	fb := &fakeBroker{
+	s.fb = &fakeBroker{
 		svidResp: &broker.SubscribeToX509SVIDResponse{
 			Svids: []*broker.X509SVID{{
 				SpiffeId:    workloadID.String(),
@@ -273,7 +382,7 @@ func startFakeSide(t *testing.T, s *fakeSide) {
 				Hint:        "internal",
 			}},
 			FederatedBundles: map[string][]byte{
-				"spiffe://other.org": s.otherCA.cert.Raw,
+				"spiffe://other.org": s.otherSVIDCA.cert.Raw,
 				"spiffe://spire-ha":  s.haCA.cert.Raw,
 			},
 		},
@@ -292,12 +401,7 @@ func startFakeSide(t *testing.T, s *fakeSide) {
 			},
 		},
 		jwtToken: s.jwtToken,
-	}
-	if s.x509Bundles != nil {
-		fb.bundleResp = &broker.SubscribeToX509BundlesResponse{Bundles: s.x509Bundles}
-	}
-	if s.jwtBundles != nil {
-		fb.jwtBundles = &broker.SubscribeToJWTBundlesResponse{Bundles: s.jwtBundles}
+		changed:  make(chan struct{}),
 	}
 
 	// broker server identity: spiffe://example.org/spire-ha-agent
@@ -305,11 +409,24 @@ func startFakeSide(t *testing.T, s *fakeSide) {
 	serverLeaf := s.ca.issue(t, serverID)
 	svidSrc := &staticSVID{svid: &x509svid.SVID{ID: serverID, Certificates: []*x509.Certificate{serverLeaf.cert}, PrivateKey: serverLeaf.key}}
 	bundleSrc := x509bundle.FromX509Authorities(td, []*x509.Certificate{s.ca.cert})
-	creds := grpccredentials.MTLSServerCredentials(svidSrc, bundleSrc, tlsconfig.AuthorizeAny())
-	brokerServer := grpc.NewServer(grpc.Creds(creds))
-	broker.RegisterAPIServer(brokerServer, fb)
-	go brokerServer.Serve(testListen(t, s.brokerSock))
-	t.Cleanup(brokerServer.Stop)
+	s.brokerCreds = grpccredentials.MTLSServerCredentials(svidSrc, bundleSrc, tlsconfig.AuthorizeAny())
+	if !s.skipBroker {
+		s.brokerServer = grpc.NewServer(grpc.Creds(s.brokerCreds))
+		broker.RegisterAPIServer(s.brokerServer, s.fb)
+		go s.brokerServer.Serve(testListen(t, s.brokerSock))
+		t.Cleanup(s.brokerServer.Stop)
+	}
+}
+
+// Restarts the side's broker server on the same socket after a Stop(), for
+// recovery testing.
+func (s *fakeSide) restartBroker(t *testing.T) {
+	t.Helper()
+	_ = os.Remove(s.brokerSock)
+	s.brokerServer = grpc.NewServer(grpc.Creds(s.brokerCreds))
+	broker.RegisterAPIServer(s.brokerServer, s.fb)
+	go s.brokerServer.Serve(testListen(t, s.brokerSock))
+	t.Cleanup(s.brokerServer.Stop)
 }
 
 func certCNs(t *testing.T, der []byte) []string {
@@ -345,6 +462,26 @@ func checkEqual(t *testing.T, what string, got, want []string) {
 	if fmt.Sprintf("%v", got) != fmt.Sprintf("%v", want) {
 		t.Errorf("%s: got %v want %v", what, got, want)
 	}
+}
+
+// The per-SVID federated bundle is passed through from whichever side
+// answered the request, so it must carry exactly one side's authority. A
+// union here would mean it had been substituted out of our own merged view,
+// which is scoped to the spire-ha-agent's own federation config rather than
+// the caller's.
+func checkFederatedPassthrough(t *testing.T, what string, der []byte, sides ...*fakeSide) {
+	t.Helper()
+	cns := certCNs(t, der)
+	if len(cns) != 1 {
+		t.Errorf("%s: got %v, want exactly one side's authority (not a union)", what, cns)
+		return
+	}
+	for _, s := range sides {
+		if cns[0] == s.otherSVIDCA.cert.Subject.CommonName {
+			return
+		}
+	}
+	t.Errorf("%s: got %v, which is not any side's federated SVID authority", what, cns)
 }
 
 func sortedKeys[V any](m map[string]V) []string {
@@ -388,7 +525,7 @@ func TestBrokerMode(t *testing.T) {
 	t.Setenv("SPIRE_HA_AGENT_VSOCK", "")
 
 	// brokerMain never returns; its goroutines die with the test process.
-	go brokerMain()
+	go brokerMain("")
 
 	// wait for the downstream socket to accept
 	deadline := time.Now().Add(30 * time.Second)
@@ -428,17 +565,22 @@ func TestBrokerMode(t *testing.T) {
 	checkEqual(t, "x509svid.hint", []string{svidResp.Svids[0].Hint}, []string{"internal"})
 	checkEqual(t, "x509svid.bundle", certCNs(t, svidResp.Svids[0].Bundle), []string{"A-CA", "B-CA", "HA-CA-A", "HA-CA-B"})
 	checkEqual(t, "x509svid.federated-tds", sortedKeys(svidResp.FederatedBundles), []string{"other.org"})
-	checkEqual(t, "x509svid.federated.other.org", certCNs(t, svidResp.FederatedBundles["other.org"]), []string{"OTHER-CA-A", "OTHER-CA-B"})
+	checkFederatedPassthrough(t, "x509svid.federated.other.org", svidResp.FederatedBundles["other.org"], sideA, sideB)
 
 	// --- FetchX509Bundles ---
 	bundleStream, err := wc.FetchX509Bundles(ctx, &workload.X509BundlesRequest{})
 	if err != nil {
 		t.Fatalf("FetchX509Bundles: %v", err)
 	}
-	bundleResp, err := bundleStream.Recv()
-	if err != nil {
-		t.Fatalf("FetchX509Bundles recv: %v", err)
-	}
+	// Federated bundles come from the caller's own responses rather than the
+	// merged global map, so this stream sends as soon as one side answers and
+	// converges to both sides' view a moment later. Both servers carry the
+	// same federation config in a real deployment, which makes those two
+	// messages identical there; the fakes diverge on purpose so the assertion
+	// can tell a passed-through value from a substituted one.
+	bundleResp := recvUntil(t, "x509bundles both sides", bundleStream.Recv, func(r *workload.X509BundlesResponse) bool {
+		return len(certCNs(t, r.Bundles["other.org"])) == 2
+	})
 	checkEqual(t, "x509bundles.tds", sortedKeys(bundleResp.Bundles), []string{"example.org", "other.org"})
 	checkEqual(t, "x509bundles.example.org", certCNs(t, bundleResp.Bundles["example.org"]), []string{"A-CA", "B-CA", "HA-CA-A", "HA-CA-B"})
 	checkEqual(t, "x509bundles.other.org", certCNs(t, bundleResp.Bundles["other.org"]), []string{"OTHER-CA-A", "OTHER-CA-B"})
@@ -461,10 +603,9 @@ func TestBrokerMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchJWTBundles: %v", err)
 	}
-	jwtBundleResp, err := jwtBundleStream.Recv()
-	if err != nil {
-		t.Fatalf("FetchJWTBundles recv: %v", err)
-	}
+	jwtBundleResp := recvUntil(t, "jwtbundles both sides", jwtBundleStream.Recv, func(r *workload.JWTBundlesResponse) bool {
+		return len(kidsOf(t, r.Bundles["other.org"])) == 2
+	})
 	checkEqual(t, "jwtbundles.tds", sortedKeys(jwtBundleResp.Bundles), []string{"example.org", "other.org"})
 	checkEqual(t, "jwtbundles.example.org.kids", kidsOf(t, jwtBundleResp.Bundles["example.org"]), []string{"a1", "b1", "ha-a", "ha-b"})
 	checkEqual(t, "jwtbundles.other.org.kids", kidsOf(t, jwtBundleResp.Bundles["other.org"]), []string{"o-a", "o-b"})

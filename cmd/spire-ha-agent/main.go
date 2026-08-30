@@ -586,13 +586,17 @@ func main() {
 	wg.Add(1)
 	jwtWg.Add(1)
 	mode := flag.String("mode", "delegated", `upstream API mode: "delegated" or "broker"`)
+	configPath := flag.String("config", "", "path to YAML config file (broker mode only)")
 	flag.Parse()
 	if *mode == "broker" {
-		brokerMain()
+		brokerMain(*configPath)
 		return
 	}
 	if *mode != "delegated" {
 		log.Fatalf("unknown -mode %q (expected \"delegated\" or \"broker\")", *mode)
+	}
+	if *configPath != "" {
+		log.Fatalf("-config is only supported with -mode=broker")
 	}
 	lf := &peertracker.ListenerFactory{}
         var lis *peertracker.Listener

@@ -86,7 +86,7 @@ func TestBrokerLateJoiningSide(t *testing.T) {
 	t.Setenv("SPIRE_HA_AGENT_VSOCK", "")
 
 	// brokerMain never returns; its goroutines die with the test process.
-	go brokerMain()
+	go brokerMain("")
 
 	deadline := time.Now().Add(30 * time.Second)
 	for {
@@ -204,7 +204,7 @@ func TestBrokerSingleMode(t *testing.T) {
 	t.Setenv("SPIRE_HA_AGENT_VSOCK", "")
 
 	// brokerMain never returns; its goroutines die with the test process.
-	go brokerMain()
+	go brokerMain("")
 
 	deadline := time.Now().Add(30 * time.Second)
 	for {
