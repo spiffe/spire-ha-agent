@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+# A new push to the same branch supersedes any run still in flight.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Release artifacts are linux-only (see .goreleaser.yaml), so this is the
+    # platform that actually ships.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # Track the toolchain the module declares rather than pinning a
+          # second copy of the version here.
+          go-version-file: go.mod
+
+      - name: Build
+        run: go build ./...
+
+      # -count=1 defeats the cached test results that setup-go's build cache
+      # would otherwise replay, so a re-run genuinely re-executes the suite.
+      # The broker tests stand up real gRPC servers over unix sockets and poll
+      # them, so they need a timeout well above the default per-package 10m
+      # only if a deadlock occurs -- 15m turns a hang into a stack dump rather
+      # than a job that burns the runner's full allowance.
+      - name: Test
+        run: go test -race -count=1 -timeout 15m ./...

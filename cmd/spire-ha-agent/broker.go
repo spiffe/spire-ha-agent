@@ -23,10 +23,12 @@ import (
 	"github.com/spiffe/go-spiffe/v2/spiffegrpc/grpccredentials"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
+	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	"github.com/spiffe/go-spiffe/v2/workloadapi"
 	"github.com/spiffe/spire/pkg/common/api/middleware"
 	"google.golang.org/grpc"
 	codes "google.golang.org/grpc/codes"
+	"google.golang.org/grpc/keepalive"
 	metadata "google.golang.org/grpc/metadata"
 	status "google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -75,6 +77,12 @@ type brokerClientSet struct {
 	trustDomain spiffeid.TrustDomain
 	x509Bundles map[string]*x509bundle.Bundle
 	jwtBundles  map[string]jose.JSONWebKeySet
+	// Whether each of this side's two global bundle subscriptions is
+	// currently established. These are the liveness signal: the streams are
+	// quiet when nothing changes, so health means "the subscription is up",
+	// never "we heard from it recently".
+	x509SubUp bool
+	jwtSubUp  bool
 }
 
 type brokerServer struct {
@@ -82,14 +90,20 @@ type brokerServer struct {
 	jwtBundleUpdate  chan brokerJWTBundleUpdated
 	rawBundles       map[string][]byte
 	rawJwtBundles    map[string][]byte
-	bundleChan       chan struct{}
-	jwtBundleChan    chan struct{}
+	// The merged bundles in parsed form, for verifying downstream broker
+	// endpoint clients, and the SVID that endpoint serves as its own
+	// certificate. Both are unused when the endpoint is not configured.
+	mergedX509    map[string]*x509bundle.Bundle
+	serverSVID    *x509svid.SVID
+	bundleChan    chan struct{}
+	jwtBundleChan chan struct{}
 	// Closed and replaced whenever an upstream side's client becomes
 	// available, so streams opened while a side was absent can start that
 	// side's pump instead of staying pinned to whoever was up at open time.
 	// Unlike bundleChan this is created up front: it fires after startup has
 	// settled, so a handler that captured a nil channel would never wake.
 	clientsChan chan struct{}
+	metrics     *brokerMetrics
 	bundleLock  sync.RWMutex
 	localTD     spiffeid.TrustDomain
 	clients     [2]brokerClientSet
@@ -163,6 +177,82 @@ func (bs *brokerServer) sidesAvailable() string {
 	}
 }
 
+func sideName(id int) string {
+	if id == 0 {
+		return "a"
+	}
+	return "b"
+}
+
+// Records whether one of a side's global bundle subscriptions is established,
+// logging and exporting only on a transition so a healthy side stays quiet.
+// cause is the error that took it down, nil when coming up.
+func (bs *brokerServer) markSubscription(id int, clientName, stream string, up bool, cause error) {
+	bs.bundleLock.Lock()
+	var prev bool
+	switch stream {
+	case "x509":
+		prev = bs.clients[id].x509SubUp
+		bs.clients[id].x509SubUp = up
+	case "jwt":
+		prev = bs.clients[id].jwtSubUp
+		bs.clients[id].jwtSubUp = up
+	}
+	changed := prev != up
+	if changed && bs.metrics != nil {
+		// Published under the same lock that computes it. A side's two
+		// subscriptions recover concurrently, and writing the aggregate after
+		// releasing the lock lets the goroutine that computed it before the
+		// other stream came up land last, pinning the side to down while both
+		// per-stream gauges read up.
+		sideUp := bs.clients[id].x509SubUp && bs.clients[id].jwtSubUp
+		bs.metrics.upstreamUp.WithLabelValues(sideName(id), stream).Set(boolGauge(up))
+		bs.metrics.upstreamSideUp.WithLabelValues(sideName(id)).Set(boolGauge(sideUp))
+	}
+	bs.bundleLock.Unlock()
+
+	if !changed {
+		return
+	}
+	if up {
+		log.Printf("%s: %s bundle subscription up", clientName, stream)
+	} else {
+		log.Printf("%s: %s bundle subscription down: %v", clientName, stream, cause)
+	}
+}
+
+func boolGauge(v bool) float64 {
+	if v {
+		return 1
+	}
+	return 0
+}
+
+// Whether every one of a side's global bundle subscriptions is established.
+func (bs *brokerServer) sideHealthy(id int) bool {
+	bs.bundleLock.RLock()
+	defer bs.bundleLock.RUnlock()
+	return bs.clients[id].x509SubUp && bs.clients[id].jwtSubUp
+}
+
+// Which upstream sides are currently serving us: none, a, b or a+b. Unlike
+// sidesAvailable this can go back down, because it tracks the subscriptions
+// rather than whether setup ever completed.
+func (bs *brokerServer) sidesHealthy() string {
+	a := bs.sideHealthy(0)
+	b := bs.multi && bs.sideHealthy(1)
+	switch {
+	case a && b:
+		return "a+b"
+	case a:
+		return "a"
+	case b:
+		return "b"
+	default:
+		return "none"
+	}
+}
+
 // Starts the upstream pump for every side that has a client and does not
 // already have one on this stream, recording it in started. Streams call
 // this when they open and again on every currentClientsChan wake, so a side
@@ -191,19 +281,24 @@ func (bs *brokerServer) localTDName() string {
 	return bs.localTD.Name()
 }
 
-func getBrokerX509SVIDs(dctx context.Context, pid int, client broker.APIClient, notify chan *broker.SubscribeToX509SVIDResponse) {
+// The workload reference is passed through verbatim rather than built from
+// a PID here: the downstream broker endpoint forwards its caller's own
+// reference, which may be any type the upstream attestors understand. tag
+// identifies the stream in logs (a PID for workload API callers, the
+// broker's SPIFFE ID for endpoint callers).
+func getBrokerX509SVIDs(dctx context.Context, ref *broker.WorkloadReference, tag string, client broker.APIClient, notify chan *broker.SubscribeToX509SVIDResponse) {
 	// A side that never finished setup (e.g. absent since our startup) has
 	// no client yet; the other side's pump serves the stream alone.
 	if client == nil {
 		return
 	}
 	for {
-		upstream, err := client.SubscribeToX509SVID(brokerMD(dctx), &broker.SubscribeToX509SVIDRequest{Reference: pidWorkloadReference(pid)})
+		upstream, err := client.SubscribeToX509SVID(brokerMD(dctx), &broker.SubscribeToX509SVIDRequest{Reference: ref})
 		if err != nil {
 			if errors.Is(dctx.Err(), context.Canceled) {
 				return
 			}
-			log.Printf("broker x509cert %d upstream error: %v", pid, err)
+			log.Printf("broker x509cert %s upstream error: %v", tag, err)
 			time.Sleep(5 * time.Second)
 			continue
 		}
@@ -211,14 +306,14 @@ func getBrokerX509SVIDs(dctx context.Context, pid int, client broker.APIClient, 
 			resp, err := upstream.Recv()
 			if err != nil {
 				if errors.Is(dctx.Err(), context.Canceled) {
-					log.Printf("broker x509cert %d canceled", pid)
+					log.Printf("broker x509cert %s canceled", tag)
 					return
 				}
-				log.Printf("broker x509cert %d upstream error2: %v", pid, err)
+				log.Printf("broker x509cert %s upstream error2: %v", tag, err)
 				time.Sleep(5 * time.Second)
 				break
 			}
-			log.Printf("broker x509cert %d upstream got cert", pid)
+			log.Printf("broker x509cert %s upstream got cert", tag)
 			select {
 			case notify <- resp:
 			case <-dctx.Done():
@@ -228,17 +323,17 @@ func getBrokerX509SVIDs(dctx context.Context, pid int, client broker.APIClient, 
 	}
 }
 
-func getBrokerX509Bundles(dctx context.Context, pid int, client broker.APIClient, notify chan *broker.SubscribeToX509BundlesResponse) {
+func getBrokerX509Bundles(dctx context.Context, ref *broker.WorkloadReference, tag string, client broker.APIClient, notify chan *broker.SubscribeToX509BundlesResponse) {
 	if client == nil {
 		return
 	}
 	for {
-		upstream, err := client.SubscribeToX509Bundles(brokerMD(dctx), &broker.SubscribeToX509BundlesRequest{Reference: pidWorkloadReference(pid)})
+		upstream, err := client.SubscribeToX509Bundles(brokerMD(dctx), &broker.SubscribeToX509BundlesRequest{Reference: ref})
 		if err != nil {
 			if errors.Is(dctx.Err(), context.Canceled) {
 				return
 			}
-			log.Printf("broker x509bundles %d upstream error: %v", pid, err)
+			log.Printf("broker x509bundles %s upstream error: %v", tag, err)
 			time.Sleep(5 * time.Second)
 			continue
 		}
@@ -246,10 +341,10 @@ func getBrokerX509Bundles(dctx context.Context, pid int, client broker.APIClient
 			resp, err := upstream.Recv()
 			if err != nil {
 				if errors.Is(dctx.Err(), context.Canceled) {
-					log.Printf("broker x509bundles %d canceled", pid)
+					log.Printf("broker x509bundles %s canceled", tag)
 					return
 				}
-				log.Printf("broker x509bundles %d upstream error2: %v", pid, err)
+				log.Printf("broker x509bundles %s upstream error2: %v", tag, err)
 				time.Sleep(5 * time.Second)
 				break
 			}
@@ -262,17 +357,17 @@ func getBrokerX509Bundles(dctx context.Context, pid int, client broker.APIClient
 	}
 }
 
-func getBrokerJWTBundles(dctx context.Context, pid int, client broker.APIClient, notify chan *broker.SubscribeToJWTBundlesResponse) {
+func getBrokerJWTBundles(dctx context.Context, ref *broker.WorkloadReference, tag string, client broker.APIClient, notify chan *broker.SubscribeToJWTBundlesResponse) {
 	if client == nil {
 		return
 	}
 	for {
-		upstream, err := client.SubscribeToJWTBundles(brokerMD(dctx), &broker.SubscribeToJWTBundlesRequest{Reference: pidWorkloadReference(pid)})
+		upstream, err := client.SubscribeToJWTBundles(brokerMD(dctx), &broker.SubscribeToJWTBundlesRequest{Reference: ref})
 		if err != nil {
 			if errors.Is(dctx.Err(), context.Canceled) {
 				return
 			}
-			log.Printf("broker jwtbundles %d upstream error: %v", pid, err)
+			log.Printf("broker jwtbundles %s upstream error: %v", tag, err)
 			time.Sleep(5 * time.Second)
 			continue
 		}
@@ -280,10 +375,10 @@ func getBrokerJWTBundles(dctx context.Context, pid int, client broker.APIClient,
 			resp, err := upstream.Recv()
 			if err != nil {
 				if errors.Is(dctx.Err(), context.Canceled) {
-					log.Printf("broker jwtbundles %d canceled", pid)
+					log.Printf("broker jwtbundles %s canceled", tag)
 					return
 				}
-				log.Printf("broker jwtbundles %d upstream error2: %v", pid, err)
+				log.Printf("broker jwtbundles %s upstream error2: %v", tag, err)
 				time.Sleep(5 * time.Second)
 				break
 			}
@@ -296,19 +391,19 @@ func getBrokerJWTBundles(dctx context.Context, pid int, client broker.APIClient,
 	}
 }
 
-func getBrokerJWT(dctx context.Context, pid int, audience []string, spiffeID string, client broker.APIClient, notify chan *broker.FetchJWTSVIDResponse) {
+func getBrokerJWT(dctx context.Context, ref *broker.WorkloadReference, tag string, audience []string, spiffeID string, client broker.APIClient, notify chan *broker.FetchJWTSVIDResponse) {
 	var resp *broker.FetchJWTSVIDResponse
 	// A side that never finished setup has no client yet; report the nil
 	// response so the caller counts it as a failed side.
 	if client != nil {
 		var err error
 		resp, err = client.FetchJWTSVID(brokerMD(dctx), &broker.FetchJWTSVIDRequest{
-			Reference: pidWorkloadReference(pid),
+			Reference: ref,
 			Audience:  audience,
 			SpiffeId:  spiffeID,
 		})
 		if err != nil {
-			log.Printf("broker jwt %d upstream error: %v", pid, err)
+			log.Printf("broker jwt %s upstream error: %v", tag, err)
 			resp = nil
 		}
 	}
@@ -318,59 +413,86 @@ func getBrokerJWT(dctx context.Context, pid int, audience []string, spiffeID str
 	}
 }
 
-// Converts a broker SVID response to a workload API response. The per-SVID
-// bundle and federated bundles are taken from the merged view of both
-// brokers when available so a workload can validate peers minted by either
-// server; the response's inline bundles are the fallback until the merged
-// state covers that trust domain.
-func (bs *brokerServer) brokerResponseToWorkloadResponse(resp *broker.SubscribeToX509SVIDResponse) *workload.X509SVIDResponse {
-	bs.bundleLock.RLock()
-	defer bs.bundleLock.RUnlock()
+// Builds the per-SVID bundles (index-aligned with resp.Svids) and the
+// federated bundles for one upstream SVID response, both keyed by bare trust
+// domain name.
+//
+// An SVID's own trust domain is the local HA one, so its bundle is served
+// from the merged A+B+spire-ha union: that is what lets a workload validate
+// a peer minted by the other server. The response's inline bundle is the
+// fallback until the merge covers that domain. Federated domains are passed
+// through untouched (see the loop below), and spire-ha is folded away
+// entirely -- its authorities live in the local trust domain bundle and it is
+// never exposed as a federated domain.
+//
+// Shared with the downstream broker endpoint, which re-keys the result by
+// trust domain SPIFFE ID as the Broker API requires. Caller must hold
+// bundleLock (read).
+func (bs *brokerServer) mergeSVIDParts(resp *broker.SubscribeToX509SVIDResponse) ([][]byte, map[string][]byte) {
+	// Read directly rather than via localTDName(): callers already hold
+	// bundleLock for read, and re-acquiring RLock deadlocks if a writer has
+	// queued in between.
+	localName := bs.localTD.Name()
 
-	res := &workload.X509SVIDResponse{
-		FederatedBundles: make(map[string][]byte),
-		Crl:              resp.GetCrl(),
-	}
+	bundles := make([][]byte, 0, len(resp.GetSvids()))
 	for _, svid := range resp.GetSvids() {
 		bundle := svid.GetBundle()
-		if id, err := spiffeid.FromString(svid.GetSpiffeId()); err == nil {
-			if merged, ok := bs.rawBundles[id.TrustDomain().Name()]; ok {
+		if id, err := spiffeid.FromString(svid.GetSpiffeId()); err == nil && id.TrustDomain().Name() == localName {
+			if merged, ok := bs.rawBundles[localName]; ok {
 				bundle = merged
 			}
 		}
-		res.Svids = append(res.Svids, &workload.X509SVID{
-			SpiffeId:    svid.GetSpiffeId(),
-			X509Svid:    svid.GetX509Svid(),
-			X509SvidKey: svid.GetX509SvidKey(),
-			Bundle:      bundle,
-			Hint:        svid.GetHint(),
-		})
+		bundles = append(bundles, bundle)
 	}
+	federated := make(map[string][]byte)
 	for tdID, raw := range resp.GetFederatedBundles() {
 		td, err := spiffeid.TrustDomainFromString(tdID)
 		if err != nil {
 			log.Printf("broker: bad federated bundle trust domain %q: %v", tdID, err)
 			continue
 		}
-		// spire-ha authorities are folded into the local trust domain
-		// bundle, never exposed as a federated domain.
 		if td.Name() == haTrustDomainName {
 			continue
 		}
-		val := raw
-		if merged, ok := bs.rawBundles[td.Name()]; ok {
-			val = merged
-		}
-		res.FederatedBundles[td.Name()] = val
+		// Passed through from the caller's own upstream response, never
+		// substituted from our merged view: both sides are expected to carry
+		// the same federation config, and the caller's federates_with list
+		// is configured on its own registration entry, not on ours.
+		federated[td.Name()] = raw
+	}
+	return bundles, federated
+}
+
+func (bs *brokerServer) brokerResponseToWorkloadResponse(resp *broker.SubscribeToX509SVIDResponse) *workload.X509SVIDResponse {
+	bs.bundleLock.RLock()
+	defer bs.bundleLock.RUnlock()
+
+	svidBundles, federated := bs.mergeSVIDParts(resp)
+	res := &workload.X509SVIDResponse{
+		FederatedBundles: federated,
+		Crl:              resp.GetCrl(),
+	}
+	for i, svid := range resp.GetSvids() {
+		res.Svids = append(res.Svids, &workload.X509SVID{
+			SpiffeId:    svid.GetSpiffeId(),
+			X509Svid:    svid.GetX509Svid(),
+			X509SvidKey: svid.GetX509SvidKey(),
+			Bundle:      svidBundles[i],
+			Hint:        svid.GetHint(),
+		})
 	}
 	return res
 }
 
-func (bs *brokerServer) brokerBundlesToWorkloadBundleResponse(resps ...*broker.SubscribeToX509BundlesResponse) *workload.X509BundlesResponse {
-	bs.bundleLock.RLock()
-	defer bs.bundleLock.RUnlock()
-
-	res := &workload.X509BundlesResponse{Bundles: make(map[string][]byte)}
+// Merges X509 bundle responses from both upstream brokers into a map keyed
+// by bare trust domain name, plus the deduplicated CRLs. The local trust
+// domain is served from the merged A+B+spire-ha union; every other domain is
+// the union of whatever the caller's own responses carried for it. spire-ha
+// is folded away. Caller must hold bundleLock (read).
+func (bs *brokerServer) mergeX509BundleMaps(resps ...*broker.SubscribeToX509BundlesResponse) (map[string][]byte, [][]byte) {
+	localName := bs.localTD.Name()
+	bundles := make(map[string][]byte)
+	var crls [][]byte
 	inline := make(map[string][][]byte)
 	seenCrl := make(map[string]bool)
 	for _, resp := range resps {
@@ -380,7 +502,7 @@ func (bs *brokerServer) brokerBundlesToWorkloadBundleResponse(resps ...*broker.S
 		for _, crl := range resp.GetCrl() {
 			if !seenCrl[string(crl)] {
 				seenCrl[string(crl)] = true
-				res.Crl = append(res.Crl, crl)
+				crls = append(crls, crl)
 			}
 		}
 		for tdID, raw := range resp.GetBundles() {
@@ -396,9 +518,14 @@ func (bs *brokerServer) brokerBundlesToWorkloadBundleResponse(resps ...*broker.S
 		}
 	}
 	for name, raws := range inline {
-		if merged, ok := bs.rawBundles[name]; ok {
-			res.Bundles[name] = merged
-			continue
+		// Only the local trust domain is served from the merged view (the
+		// A+B+spire-ha union that makes it HA). Federated domains come
+		// straight from the caller's own responses.
+		if name == localName {
+			if merged, ok := bs.rawBundles[name]; ok {
+				bundles[name] = merged
+				continue
+			}
 		}
 		td, err := spiffeid.TrustDomainFromString(name)
 		if err != nil {
@@ -415,16 +542,27 @@ func (bs *brokerServer) brokerBundlesToWorkloadBundleResponse(resps ...*broker.S
 				bundle.AddX509Authority(cert)
 			}
 		}
-		res.Bundles[name] = ConcatRawCertsFromCerts(bundle.X509Authorities())
+		bundles[name] = ConcatRawCertsFromCerts(bundle.X509Authorities())
 	}
-	return res
+	return bundles, crls
 }
 
-func (bs *brokerServer) brokerJWTBundlesToWorkloadResponse(resps ...*broker.SubscribeToJWTBundlesResponse) *workload.JWTBundlesResponse {
+func (bs *brokerServer) brokerBundlesToWorkloadBundleResponse(resps ...*broker.SubscribeToX509BundlesResponse) *workload.X509BundlesResponse {
 	bs.bundleLock.RLock()
 	defer bs.bundleLock.RUnlock()
 
-	res := &workload.JWTBundlesResponse{Bundles: make(map[string][]byte)}
+	bundles, crls := bs.mergeX509BundleMaps(resps...)
+	return &workload.X509BundlesResponse{Bundles: bundles, Crl: crls}
+}
+
+// Merges JWT bundle responses from both upstream brokers into a map keyed by
+// bare trust domain name. The local trust domain is served from the merged
+// A+B+spire-ha union; every other domain is a KeyID-deduped union of
+// whatever the caller's own responses carried for it. spire-ha is folded
+// away. Caller must hold bundleLock (read).
+func (bs *brokerServer) mergeJWTBundleMaps(resps ...*broker.SubscribeToJWTBundlesResponse) map[string][]byte {
+	localName := bs.localTD.Name()
+	bundles := make(map[string][]byte)
 	inline := make(map[string][][]byte)
 	for _, resp := range resps {
 		if resp == nil {
@@ -443,9 +581,13 @@ func (bs *brokerServer) brokerJWTBundlesToWorkloadResponse(resps ...*broker.Subs
 		}
 	}
 	for name, raws := range inline {
-		if merged, ok := bs.rawJwtBundles[name]; ok {
-			res.Bundles[name] = merged
-			continue
+		// Merged view for the local trust domain only; federated domains
+		// come straight from the caller's own responses.
+		if name == localName {
+			if merged, ok := bs.rawJwtBundles[name]; ok {
+				bundles[name] = merged
+				continue
+			}
 		}
 		var set jose.JSONWebKeySet
 		kids := make(map[string]bool)
@@ -467,9 +609,16 @@ func (bs *brokerServer) brokerJWTBundlesToWorkloadResponse(resps ...*broker.Subs
 			log.Printf("broker: failed to marshal jwt bundle for %s: %v", name, err)
 			continue
 		}
-		res.Bundles[name] = out
+		bundles[name] = out
 	}
-	return res
+	return bundles
+}
+
+func (bs *brokerServer) brokerJWTBundlesToWorkloadResponse(resps ...*broker.SubscribeToJWTBundlesResponse) *workload.JWTBundlesResponse {
+	bs.bundleLock.RLock()
+	defer bs.bundleLock.RUnlock()
+
+	return &workload.JWTBundlesResponse{Bundles: bs.mergeJWTBundleMaps(resps...)}
 }
 
 // Fetch X.509-SVIDs for all SPIFFE identities the workload is entitled to,
@@ -481,14 +630,16 @@ func (s *brokerServer) FetchX509SVID(req *workload.X509SVIDRequest, downstream w
 	pid := dctx.Value(callerPIDKey{}).(int)
 	log.Printf("broker x509fetch calling pid: %d", pid)
 
+	ref := pidWorkloadReference(pid)
+	tag := strconv.Itoa(pid)
 	chan1 := make(chan *broker.SubscribeToX509SVIDResponse)
 	chan2 := make(chan *broker.SubscribeToX509SVIDResponse)
 	var started [2]bool
 	startPump := func(id int, client broker.APIClient) {
 		if id == 0 {
-			go getBrokerX509SVIDs(dctx, pid, client, chan1)
+			go getBrokerX509SVIDs(dctx, ref, tag, client, chan1)
 		} else {
-			go getBrokerX509SVIDs(dctx, pid, client, chan2)
+			go getBrokerX509SVIDs(dctx, ref, tag, client, chan2)
 		}
 	}
 	clientsChan := s.currentClientsChan()
@@ -570,14 +721,16 @@ func (s *brokerServer) FetchX509Bundles(req *workload.X509BundlesRequest, downst
 	pid := dctx.Value(callerPIDKey{}).(int)
 	log.Printf("broker x509bundles calling pid: %d", pid)
 
+	ref := pidWorkloadReference(pid)
+	tag := strconv.Itoa(pid)
 	chan1 := make(chan *broker.SubscribeToX509BundlesResponse)
 	chan2 := make(chan *broker.SubscribeToX509BundlesResponse)
 	var started [2]bool
 	startPump := func(id int, client broker.APIClient) {
 		if id == 0 {
-			go getBrokerX509Bundles(dctx, pid, client, chan1)
+			go getBrokerX509Bundles(dctx, ref, tag, client, chan1)
 		} else {
-			go getBrokerX509Bundles(dctx, pid, client, chan2)
+			go getBrokerX509Bundles(dctx, ref, tag, client, chan2)
 		}
 	}
 	clientsChan := s.currentClientsChan()
@@ -652,12 +805,14 @@ func (s *brokerServer) FetchJWTSVID(dctx context.Context, downstream *workload.J
 	// Unary, so the clients are re-read on every call and a late side is
 	// picked up without any of the stream bookkeeping below.
 	c0, c1 := s.upstreamClients()
+	ref := pidWorkloadReference(pid)
+	tag := strconv.Itoa(pid)
 	failLimit := 1
 	chan1 := make(chan *broker.FetchJWTSVIDResponse)
-	go getBrokerJWT(dctx, pid, downstream.Audience, downstream.SpiffeId, c0, chan1)
+	go getBrokerJWT(dctx, ref, tag, downstream.Audience, downstream.SpiffeId, c0, chan1)
 	if s.multi {
 		failLimit = 2
-		go getBrokerJWT(dctx, pid, downstream.Audience, downstream.SpiffeId, c1, chan1)
+		go getBrokerJWT(dctx, ref, tag, downstream.Audience, downstream.SpiffeId, c1, chan1)
 	}
 
 	var count int
@@ -698,14 +853,16 @@ func (s *brokerServer) FetchJWTBundles(req *workload.JWTBundlesRequest, downstre
 	pid := dctx.Value(callerPIDKey{}).(int)
 	log.Printf("broker jwtbundles calling pid: %d", pid)
 
+	ref := pidWorkloadReference(pid)
+	tag := strconv.Itoa(pid)
 	chan1 := make(chan *broker.SubscribeToJWTBundlesResponse)
 	chan2 := make(chan *broker.SubscribeToJWTBundlesResponse)
 	var started [2]bool
 	startPump := func(id int, client broker.APIClient) {
 		if id == 0 {
-			go getBrokerJWTBundles(dctx, pid, client, chan1)
+			go getBrokerJWTBundles(dctx, ref, tag, client, chan1)
 		} else {
-			go getBrokerJWTBundles(dctx, pid, client, chan2)
+			go getBrokerJWTBundles(dctx, ref, tag, client, chan2)
 		}
 	}
 	clientsChan := s.currentClientsChan()
@@ -779,7 +936,7 @@ func (s *brokerServer) ValidateJWTSVID(ctx context.Context, downstream *workload
 	return nil, status.Errorf(codes.Unimplemented, "method ValidateJWTSVID not implemented")
 }
 
-func setupBrokerClient(bs *brokerServer, clientName string, id int, brokerAddr string, workloadAddr string, cs *brokerClientSet) {
+func setupBrokerClient(bs *brokerServer, clientName string, id int, brokerAddr string, workloadAddr string, keepaliveTime, keepaliveTimeout time.Duration, cs *brokerClientSet) {
 	var source *workloadapi.X509Source
 	for {
 		var err error
@@ -802,22 +959,35 @@ func setupBrokerClient(bs *brokerServer, clientName string, id int, brokerAddr s
 	}
 	// The source is intentionally never closed: it keeps rotating our SVID
 	// so the broker mTLS client certificate stays fresh.
-	cs.source = source
 	svid, err := source.GetX509SVID()
 	if err != nil {
 		log.Fatalf("%s: failed to get our own SVID: %v", clientName, err)
 	}
-	cs.trustDomain = svid.ID.TrustDomain()
+	trustDomain := svid.ID.TrustDomain()
 	log.Printf("%s: our identity: %s", clientName, svid.ID)
 
+	// The source is published under the lock the downstream broker
+	// endpoint's SVID picker reads it with.
 	bs.bundleLock.Lock()
+	cs.source = source
+	cs.trustDomain = trustDomain
 	if bs.localTD.IsZero() {
-		bs.localTD = cs.trustDomain
+		bs.localTD = trustDomain
 		log.Printf("Our trust domain detected as: %s\n", bs.localTD.Name())
-	} else if bs.localTD != cs.trustDomain {
-		log.Fatalf("%s: trust domain mismatch: %s != %s", clientName, cs.trustDomain, bs.localTD)
+	} else if bs.localTD != trustDomain {
+		log.Fatalf("%s: trust domain mismatch: %s != %s", clientName, trustDomain, bs.localTD)
 	}
 	bs.bundleLock.Unlock()
+
+	// Keep the downstream broker endpoint's server certificate current:
+	// re-pick whenever this side delivers a new SVID, rather than
+	// re-evaluating both sources on every handshake.
+	bs.recomputeServerSVID()
+	go func() {
+		for range source.Updated() {
+			bs.recomputeServerSVID()
+		}
+	}()
 
 	// FIXME its hard to know what the remote id is.
 	// serverID, err := spiffeid.FromPath(cs.trustDomain, "/spire-ha-agent")
@@ -826,7 +996,36 @@ func setupBrokerClient(bs *brokerServer, clientName string, id int, brokerAddr s
 	// }
 	// creds := grpccredentials.MTLSClientCredentials(source, source, tlsconfig.AuthorizeID(serverID))
 	creds := grpccredentials.MTLSClientCredentials(source, source, tlsconfig.AuthorizeAny())
-	conn, err := grpc.NewClient(brokerTarget(brokerAddr), grpc.WithTransportCredentials(creds))
+	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(creds)}
+	if keepaliveTime > 0 {
+		// Keepalive exists to catch a wedged connection (silent drop, black
+		// holed TCP), where Recv would otherwise block forever and the side
+		// would keep reporting healthy. Everything else -- process death,
+		// socket close, RST, RPC errors -- already surfaces as a stream error.
+		//
+		// The default interval is 5m because that is the floor a stock server
+		// permits, and this is verified rather than assumed: grpc-go applies
+		// EnforcementPolicy{MinTime: 5m} whenever the server sets none
+		// (internal/transport/defaults.go, http2_server.go), maxPingStrikes is
+		// 2, so the third too-frequent ping earns a GOAWAY ENHANCE_YOUR_CALM
+		// "too_many_pings" and the connection dies -- the very failure this is
+		// meant to detect. It is HTTP/2 PING handling in the shared
+		// http2_server, so unix sockets are NOT exempt. The strike counter
+		// resets only when the server writes application data, and our bundle
+		// subscriptions are quiet by design, so strikes accumulate rather than
+		// being forgiven. SPIRE's broker endpoint sets no keepalive options,
+		// so it inherits that default; lower this only once SPIRE lets the
+		// enforcement policy be configured.
+		//
+		// PermitWithoutStream is false so we do not ping during the brief
+		// window when both subscriptions are in their retry sleep.
+		dialOpts = append(dialOpts, grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                keepaliveTime,
+			Timeout:             keepaliveTimeout,
+			PermitWithoutStream: false,
+		}))
+	}
+	conn, err := grpc.NewClient(brokerTarget(brokerAddr), dialOpts...)
 	if err != nil {
 		log.Fatalf("%s: failed to create broker client for %s: %v", clientName, brokerAddr, err)
 	}
@@ -850,6 +1049,7 @@ func setupBrokerClient(bs *brokerServer, clientName string, id int, brokerAddr s
 			stream, err := cs.client.SubscribeToX509Bundles(brokerMD(context.Background()), &broker.SubscribeToX509BundlesRequest{Reference: pidWorkloadReference(pid)})
 			if err != nil {
 				log.Printf("%s: failed to subscribe to x509 bundles: %v", clientName, err)
+				bs.markSubscription(id, clientName, "x509", false, err)
 				time.Sleep(5 * time.Second)
 				continue
 			}
@@ -857,9 +1057,13 @@ func setupBrokerClient(bs *brokerServer, clientName string, id int, brokerAddr s
 				resp, err := stream.Recv()
 				if err != nil {
 					log.Printf("%s: failed to get x509 bundles: %v", clientName, err)
+					bs.markSubscription(id, clientName, "x509", false, err)
 					time.Sleep(5 * time.Second)
 					break
 				}
+				// Marked up before parsing, so a malformed bundle (which stays
+				// on the stream) does not read as the side being down.
+				bs.markSubscription(id, clientName, "x509", true, nil)
 				set, err := parseX509Bundles(resp.GetBundles())
 				if err != nil {
 					log.Printf("%s: failed to parse x509 bundles: %v", clientName, err)
@@ -881,6 +1085,7 @@ func setupBrokerClient(bs *brokerServer, clientName string, id int, brokerAddr s
 			stream, err := cs.client.SubscribeToJWTBundles(brokerMD(context.Background()), &broker.SubscribeToJWTBundlesRequest{Reference: pidWorkloadReference(pid)})
 			if err != nil {
 				log.Printf("%s: failed to subscribe to jwt bundles: %v", clientName, err)
+				bs.markSubscription(id, clientName, "jwt", false, err)
 				time.Sleep(5 * time.Second)
 				continue
 			}
@@ -888,9 +1093,11 @@ func setupBrokerClient(bs *brokerServer, clientName string, id int, brokerAddr s
 				resp, err := stream.Recv()
 				if err != nil {
 					log.Printf("%s: failed to get jwt bundles: %v", clientName, err)
+					bs.markSubscription(id, clientName, "jwt", false, err)
 					time.Sleep(5 * time.Second)
 					break
 				}
+				bs.markSubscription(id, clientName, "jwt", true, nil)
 				jwksBundles := make(map[string]jose.JSONWebKeySet)
 				for tdID, bundle := range resp.GetBundles() {
 					td, err := spiffeid.TrustDomainFromString(tdID)
@@ -913,16 +1120,32 @@ func setupBrokerClient(bs *brokerServer, clientName string, id int, brokerAddr s
 	}()
 }
 
-func brokerMain() {
+func brokerMain(configPath string) {
+	conf, err := loadBrokerConfig(configPath)
+	if err != nil {
+		log.Fatalf("failed to load config: %v", err)
+	}
 	var wg sync.WaitGroup
 	var jwtWg sync.WaitGroup
 	wg.Add(1)
 	jwtWg.Add(1)
+	if conf.keepaliveTime > 0 && conf.keepaliveTime < safeKeepaliveTime {
+		log.Printf("WARNING: upstream_keepalive.time %s is below %s; a SPIRE agent that does not configure a keepalive enforcement policy will answer pings that frequent with GOAWAY too_many_pings and drop the connection",
+			conf.keepaliveTime, safeKeepaliveTime)
+	}
+
 	bs := &brokerServer{
-		multi:            os.Getenv("SPIRE_HA_AGENT_SINGLE") != "enabled",
+		multi:            !conf.single,
 		x509BundleUpdate: make(chan brokerX509BundleUpdated),
 		jwtBundleUpdate:  make(chan brokerJWTBundleUpdated),
 		clientsChan:      make(chan struct{}),
+		metrics:          newBrokerMetrics(),
+	}
+	bs.metrics.init(bs.multi)
+	// Served before the settle wait: "both sides down" is exactly what you
+	// want to see while startup is still blocked.
+	if conf.metrics != nil {
+		bs.metrics.serve(conf.metrics.bindAddress)
 	}
 
 	unaryInterceptor, streamInterceptor := middleware.Interceptors(middleware.Chain(
@@ -934,31 +1157,18 @@ func brokerMain() {
 		grpc.StreamInterceptor(streamInterceptor),
 	)
 
-	abroker := "unix:///var/run/spire/agent/sockets/a/broker/broker.sock"
-	bbroker := "unix:///var/run/spire/agent/sockets/b/broker/broker.sock"
-	aworkload := "unix:///var/run/spire/agent/sockets/a/public/api.sock"
-	bworkload := "unix:///var/run/spire/agent/sockets/b/public/api.sock"
-	abrokerName := "SPIRE_HA_AGENT_BROKER"
-	aworkloadName := "SPIRE_HA_AGENT_WORKLOAD_SOCKET"
-	if bs.multi {
-		abrokerName = "SPIRE_HA_AGENT_BROKER_A"
-		aworkloadName = "SPIRE_HA_AGENT_WORKLOAD_SOCKET_A"
-	}
-	if os.Getenv(abrokerName) != "" {
-		abroker = os.Getenv(abrokerName)
-	}
-	if os.Getenv(aworkloadName) != "" {
-		aworkload = os.Getenv(aworkloadName)
-	}
-	go setupBrokerClient(bs, "brokerA", 0, abroker, aworkload, &bs.clients[0])
-	if bs.multi {
-		if os.Getenv("SPIRE_HA_AGENT_BROKER_B") != "" {
-			bbroker = os.Getenv("SPIRE_HA_AGENT_BROKER_B")
+	// Periodic summary. Slower than delegated mode's 5s line because the
+	// transition logs from markSubscription carry the real signal.
+	go func() {
+		for {
+			time.Sleep(30 * time.Second)
+			log.Printf("upstream sides healthy: %s", bs.sidesHealthy())
 		}
-		if os.Getenv("SPIRE_HA_AGENT_WORKLOAD_SOCKET_B") != "" {
-			bworkload = os.Getenv("SPIRE_HA_AGENT_WORKLOAD_SOCKET_B")
-		}
-		go setupBrokerClient(bs, "brokerB", 1, bbroker, bworkload, &bs.clients[1])
+	}()
+
+	go setupBrokerClient(bs, "brokerA", 0, conf.brokerA, conf.workloadA, conf.keepaliveTime, conf.keepaliveTimeout, &bs.clients[0])
+	if bs.multi {
+		go setupBrokerClient(bs, "brokerB", 1, conf.brokerB, conf.workloadB, conf.keepaliveTime, conf.keepaliveTimeout, &bs.clients[1])
 	}
 
 	go func() {
@@ -981,6 +1191,9 @@ func brokerMain() {
 				totalBundles := len(bs.clients[0].x509Bundles) + len(bs.clients[1].x509Bundles)
 				log.Printf("We got %d x509 bundles\n", totalBundles)
 				rawBundles := make(map[string][]byte)
+				// Kept in parsed form too, for verifying downstream broker
+				// endpoint client certificates.
+				parsedBundles := make(map[string]*x509bundle.Bundle)
 				names := make(map[string]bool)
 				for i := range bs.clients {
 					for name := range bs.clients[i].x509Bundles {
@@ -1013,6 +1226,7 @@ func brokerMain() {
 						}
 					}
 					rawBundles[name] = ConcatRawCertsFromCerts(bundle.X509Authorities())
+					parsedBundles[name] = bundle
 				}
 				if initBundle {
 					log.Printf("x509 inited")
@@ -1025,6 +1239,7 @@ func brokerMain() {
 				} else {
 					log.Printf("x509 bundles changed")
 					bs.rawBundles = rawBundles
+					bs.mergedX509 = parsedBundles
 					if bs.bundleChan != nil {
 						close(bs.bundleChan)
 					}
@@ -1119,7 +1334,14 @@ func brokerMain() {
 	// A lone side satisfies bundlesSettled when it carries the other side's
 	// authorities in its spire-ha bundle, so say outright which sides we
 	// actually have rather than leaving it to be inferred from the pump logs.
-	log.Printf("Startup settled. upstream sides available: %s", bs.sidesAvailable())
+	log.Printf("Startup settled. upstream sides available: %s, healthy: %s", bs.sidesAvailable(), bs.sidesHealthy())
+
+	// Both downstream surfaces come up only now that merged bundles exist:
+	// the broker endpoint needs them to verify its clients, and an unserved
+	// socket would hang callers rather than refuse them.
+	if conf.endpoint != nil {
+		startBrokerEndpoint(bs, conf.endpoint)
+	}
 
 	// The workload API socket is created only now that the server can
 	// actually answer on it. A socket that exists but is never served turns
@@ -1127,26 +1349,15 @@ func brokerMain() {
 	// connection refused is retried cleanly and keeps readiness observable.
 	lf := &peertracker.ListenerFactory{}
 	var lis *peertracker.Listener
-	var err error
-	if os.Getenv("SPIRE_HA_AGENT_VSOCK") == "enabled" {
-		port := os.Getenv("SPIRE_HA_AGENT_PORT")
-		if port == "" {
-			port = "997"
-		}
-		iport, err := strconv.Atoi(port)
-		if err != nil {
-			log.Fatalf("failed to parse port: %v", err)
-		}
-		lis, err = lf.ListenVSock(uint32(iport))
+	if conf.vsockEnabled {
+		lis, err = lf.ListenVSock(conf.vsockPort)
 	} else {
-		socket := os.Getenv("SPIRE_HA_AGENT_SOCK")
-		if socket == "" {
-			socket = "/var/run/spire/agent/sockets/main/public/api.sock"
-		}
-		_ = os.Remove(socket)
-		lis, err = lf.ListenUnix("unix", &net.UnixAddr{Name: socket, Net: "unix"})
-		if err := os.Chmod(socket, 0777); err != nil {
-			log.Fatalf("failed to permission the socket: %v", err)
+		_ = os.Remove(conf.socket)
+		lis, err = lf.ListenUnix("unix", &net.UnixAddr{Name: conf.socket, Net: "unix"})
+		if err == nil {
+			if cerr := os.Chmod(conf.socket, 0777); cerr != nil {
+				log.Fatalf("failed to permission the socket: %v", cerr)
+			}
 		}
 	}
 	if err != nil {
