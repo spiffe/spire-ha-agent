@@ -4,7 +4,7 @@ go 1.26.10
 
 require (
 	github.com/Microsoft/go-winio v0.6.2
-	github.com/go-jose/go-jose/v4 v4.1.4
+	github.com/go-jose/go-jose/v4 v4.1.6
 	github.com/mdlayher/vsock v1.2.1
 	github.com/prometheus/client_golang v1.20.4
 	github.com/sirupsen/logrus v1.9.3
