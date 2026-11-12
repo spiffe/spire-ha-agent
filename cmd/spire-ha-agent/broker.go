@@ -1365,6 +1365,7 @@ func brokerMain(configPath string) {
 	}
 
 	workload.RegisterSpiffeWorkloadAPIServer(s, bs)
+	registerSDS(s, bs, conf.sds)
 	if err := s.Serve(lis); err != nil {
 		log.Fatalf("failed to serve: %v", err)
 	}

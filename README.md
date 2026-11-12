@@ -55,6 +55,8 @@ Broker mode is configured with environment variables and/or a YAML config file p
 | `broker_endpoint` | (config file only) | Downstream Broker API endpoint, see below | disabled |
 | `metrics.bind_address` | (config file only) | Prometheus `/metrics` listen address; block absent disables it | disabled |
 | `upstream_keepalive.time` / `.timeout` | (config file only) | gRPC keepalive on the upstream broker connections; `time: 0` disables | `5m` / `20s` |
+| `disable_sds_api` | (config file only) | Do not serve the Envoy SDS API on the Workload API socket | false |
+| `sds` | (config file only) | Envoy SDS resource names and validation, see below | SPIRE defaults |
 
 Broker mode requirements:
 
@@ -75,6 +77,49 @@ Transitions are logged as they happen (`brokerB: x509 bundle subscription down: 
 **"Up" means the subscription is currently established, not that data arrived recently.** The upstream only pushes when bundles change, so a perfectly healthy side can be silent for hours; treating silence as failure would be wrong.
 
 Process death, socket close, connection reset and RPC errors surface immediately as stream errors. A *wedged* connection (silently dropped TCP) is caught by gRPC keepalive instead. The keepalive default is 5 minutes because that is the fastest a stock server permits: gRPC servers that set no keepalive enforcement policy answer more frequent pings with GOAWAY `too_many_pings` and drop the connection, and SPIRE's broker endpoint sets no policy. This applies to unix sockets too — it is HTTP/2 ping handling, not a TCP behaviour — though on a unix socket a dead peer gives an immediate EOF anyway, so the interval only matters for `tcp://` upstreams. Lower `upstream_keepalive.time` only once SPIRE allows the enforcement policy to be configured; the agent logs a warning if you set it below 5 minutes.
+
+## Envoy SDS support
+
+In broker mode the spire-ha-agent serves the Envoy
+[SDS v3](https://www.envoyproxy.io/docs/envoy/latest/configuration/security/secret)
+API on the same socket as the Workload API, the same way the SPIRE agent does,
+so Envoy can be pointed at the spire-ha-agent socket exactly as it would be
+pointed at a SPIRE agent. Envoy is identified as a workload by its PID. The
+delegated mode does not serve SDS.
+
+The options, names and defaults match the SPIRE agent's `sds` block:
+
+```yaml
+disable_sds_api: false
+sds:
+  default_svid_name: default
+  default_bundle_name: ROOTCA
+  default_all_bundles_name: ALL
+  disable_spiffe_cert_validation: false
+```
+
+| Field | Meaning | Default |
+| --- | --- | --- |
+| `default_svid_name` | TLS certificate resource name for the workload's default X509-SVID | `default` |
+| `default_bundle_name` | Validation context resource name for the local trust domain bundle | `ROOTCA` |
+| `default_all_bundles_name` | Validation context resource name for all bundles, federated included (needs the SPIFFE certificate validator, Envoy 1.18+) | `ALL` |
+| `disable_spiffe_cert_validation` | Serve plain trusted-CA validation contexts instead of Envoy's SPIFFE certificate validator | false |
+
+Resources Envoy can request:
+
+- TLS certificates: a SPIFFE ID the workload is entitled to, or
+  `default_svid_name` for its first identity.
+- Validation contexts: `spiffe://<trust domain>` for the local or a federated
+  trust domain, `default_bundle_name` for the local trust domain, or
+  `default_all_bundles_name` for everything.
+
+The local trust domain bundle is the same HA union the Workload API serves
+(both sides plus their `spire-ha` bundles), so a certificate issued by either
+side validates. Federated bundles are those of the workload's own
+registration entry.
+
+`disable_spiffe_cert_validation` can also be set per Envoy instance through
+the node metadata key of the same name, which overrides the configured value.
 
 ## Downstream Broker API endpoint
 
