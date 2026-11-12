@@ -35,6 +35,9 @@ type brokerFileConfig struct {
 	// Keepalive on the upstream broker connections. Absent means the safe
 	// default; time: 0 disables keepalive entirely.
 	UpstreamKeepalive *keepaliveFileConfig `yaml:"upstream_keepalive"`
+	// Envoy SDS API, served on the workload API socket (see sds.go).
+	SDS           *sdsFileConfig `yaml:"sds"`
+	DisableSDSAPI *bool          `yaml:"disable_sds_api"`
 }
 
 type metricsFileConfig struct {
@@ -84,6 +87,7 @@ type brokerConfig struct {
 	workloadB    string
 	endpoint     *endpointConfig // nil => downstream broker endpoint disabled
 	metrics      *metricsConfig  // nil => metrics endpoint disabled
+	sds          *sdsConfig      // nil => Envoy SDS API disabled
 	// Keepalive on the upstream broker connections; keepaliveTime 0 disables.
 	keepaliveTime    time.Duration
 	keepaliveTimeout time.Duration
@@ -221,6 +225,8 @@ func loadBrokerConfig(path string) (*brokerConfig, error) {
 			return nil, fmt.Errorf("upstream_keepalive: timeout (%s) must be less than time (%s)", conf.keepaliveTimeout, conf.keepaliveTime)
 		}
 	}
+
+	conf.sds = resolveSDSConfig(fc.SDS, fc.DisableSDSAPI)
 
 	if fc.BrokerEndpoint != nil {
 		ep, err := resolveEndpointConfig(fc.BrokerEndpoint, conf)
